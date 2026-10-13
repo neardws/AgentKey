@@ -100,12 +100,42 @@ public final class Vault: @unchecked Sendable {
 
     public func upsert(_ item: VaultItem) throws {
         var item = item; item.updatedAt = Date()
+        if let old = try? self.item(id: item.id) {
+            // secret changed → remember previous value (encrypted, inside the item) + rotation timestamp
+            let pid = item.primaryFieldID
+            if let of = old.fields.first(where: { $0.id == pid }), let nf = item.fields.first(where: { $0.id == pid }), of.value != nf.value {
+                item.recordHistory("changed", fields: [of])
+                item.passwordChangedAt = item.updatedAt
+            }
+        } else if item.passwordChangedAt == nil {
+            item.passwordChangedAt = item.createdAt
+        }
         let rev = (file.items.first { $0.id == item.id }?.revision ?? 0) + 1
         let blob = try KeyHierarchy.seal(try Self.encoder.encode(item), key: vk, aad: Self.itemAAD(file.vaultID, item.id, rev))
         file.items.removeAll { $0.id == item.id }
         file.items.append(EncryptedItem(id: item.id, revision: rev, blob: blob))
         try save()
     }
+
+    public func item(id: UUID) throws -> VaultItem? {
+        guard let e = file.items.first(where: { $0.id == id }) else { return nil }
+        let pt = try KeyHierarchy.open(e.blob, key: vk, aad: Self.itemAAD(file.vaultID, e.id, e.revision))
+        return try Self.decoder.decode(VaultItem.self, from: pt)
+    }
+
+    /// Mark an item as used (agent release / AutoFill) for staleness tracking.
+    public func touch(id: UUID, at date: Date = Date()) throws {
+        guard var i = try item(id: id) else { return }
+        i.lastUsedAt = date
+        let rev = (file.items.first { $0.id == id }?.revision ?? 0) + 1
+        let blob = try KeyHierarchy.seal(try Self.encoder.encode(i), key: vk, aad: Self.itemAAD(file.vaultID, id, rev))
+        file.items.removeAll { $0.id == id }
+        file.items.append(EncryptedItem(id: id, revision: rev, blob: blob))
+        try save()
+    }
+
+    /// Keyed hashing for hygiene analysis (never exported).
+    public var healthKey: SymmetricKey { KeyHierarchy.subkey(vk, purpose: "health") }
 
     public func delete(id: UUID) throws {
         file.items.removeAll { $0.id == id }; try save()
