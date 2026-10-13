@@ -1,0 +1,8 @@
+{
+  "approvalTimeoutSeconds": 60,
+  "defaultRule": { "modes": ["run", "totp"] },
+  "agents": {
+    "claude-code": { "modes": ["run", "totp"], "items": ["OpenAI", "GitHub*"] },
+    "neil":        { "modes": ["run", "totp", "reveal"] }
+  }
+}
