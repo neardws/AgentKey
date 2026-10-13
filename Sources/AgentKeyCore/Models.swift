@@ -29,6 +29,22 @@ public struct VaultItem: Codable, Equatable, Identifiable, Sendable {
     public var allowedHosts: [String]
     public var createdAt: Date
     public var updatedAt: Date
+    // Lifecycle / hygiene metadata (optional so older vault files still decode)
+    public var lastUsedAt: Date?          // last AutoFill / agent release
+    public var passwordChangedAt: Date?   // last time the primary secret changed
+    public var archivedAt: Date?
+    public var trashedAt: Date?           // soft delete; purge after retention
+    public var history: [ItemHistoryEntry]?
+
+    public var isTrashed: Bool { trashedAt != nil }
+    public var isArchived: Bool { archivedAt != nil }
+
+    /// Record a previous value before changing a field (kept encrypted inside the item).
+    public mutating func recordHistory(_ reason: String, fields old: [ItemField]) {
+        var h = history ?? []
+        h.append(ItemHistoryEntry(at: Date(), reason: reason, fields: old))
+        history = Array(h.suffix(20))
+    }
 
     public init(id: UUID = UUID(), kind: ItemKind, title: String, username: String? = nil,
                 urls: [String] = [], notes: String? = nil, fields: [ItemField] = [], tags: [String] = [],
@@ -77,6 +93,12 @@ public struct VaultItem: Codable, Equatable, Identifiable, Sendable {
     public static func totp(title: String, secretOrURI: String) -> VaultItem {
         VaultItem(kind: .totp, title: title, fields: [ItemField(id: "totp", value: secretOrURI)], agentModes: [.totp])
     }
+}
+
+public struct ItemHistoryEntry: Codable, Equatable, Sendable {
+    public var at: Date
+    public var reason: String
+    public var fields: [ItemField]
 }
 
 public struct ItemOverview: Codable, Equatable, Sendable {
