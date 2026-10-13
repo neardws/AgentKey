@@ -84,6 +84,16 @@ agentkey generate --length 32
 agentkey audit verify
 ```
 
+**Agent-native output:** every command accepts `--json` (or `AGENTKEY_OUTPUT=json`); metadata commands
+(`status`, `list`, `add`, `init`, `unlock`, `lock`, `audit`) emit JSON automatically when stdout is not a TTY.
+Errors look like `{"ok":false,"error":{"code":"POLICY_DENIED","exit":65,"message":"..."}}`. For `exec`, the child's
+output stays on stdout/stderr (redacted) and JSON metadata goes to stderr. `get`/`totp`/`generate` print the raw value
+when piped unless `--json` is given.
+
+**Redaction:** `exec` / `run_with_secret` redact every released secret on stdout and stderr, streaming-safe across chunk
+boundaries. Secrets shorter than 8 characters are still redacted, but trigger a `SHORT_SECRET` warning because
+redaction of short values is unreliable.
+
 Optional policy: copy `Support/policy.example.json` to `~/Library/Application Support/AgentKey/policy.json`.
 
 ### MCP client config

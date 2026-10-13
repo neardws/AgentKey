@@ -112,8 +112,10 @@ func callTool(_ name: String, _ a: [String: Any]) -> [String: Any] {
             let so = red.redact(String(decoding: outData.prefix(cap), as: UTF8.self))
             let se = red.redact(String(decoding: errData.prefix(cap), as: UTF8.self))
             let status = Int(p.terminationStatus)
-            let text = "exit \(status)\(timedOut ? " (timed out)" : "")\n--- stdout ---\n\(so)\n--- stderr ---\n\(se)"
-            return toolResult(text, structured: ["exit_code": status, "stdout": so, "stderr": se, "timed_out": timedOut],
+            let warn = red.warning.map { "⚠️ \($0)\n" } ?? ""
+            let text = "\(warn)exit \(status)\(timedOut ? " (timed out)" : "")\n--- stdout ---\n\(so)\n--- stderr ---\n\(se)"
+            return toolResult(text, structured: ["exit_code": status, "stdout": so, "stderr": se, "timed_out": timedOut,
+                                                 "warnings": red.warning.map { [$0] } ?? [], "weak_secrets": red.weakSecrets],
                               isError: status != 0)
 
         default:
