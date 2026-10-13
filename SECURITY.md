@@ -42,5 +42,21 @@ Does **not** protect against (known limitations):
 - Cleanup plans are proposals; applying requires Touch ID / Apple Watch, can be partial, is audited per action, and
   (except `purge` of already-trashed items) is reversible. There is no MCP tool to apply plans. Note: any local process
   running as you can invoke `agentkey plan apply`, but it still cannot get past the biometric prompt.
-- Sync uploads only AES-GCM ciphertext plus non-secret metadata (record id, Lamport clock, device id, deleted flag,
-  key version) to your iCloud private database. The CloudKit adapter is not yet validated on a device.
+- (superseded) The CloudKit adapter is now a legacy module compiled only with `-DAGENTKEY_LEGACY_CLOUDKIT`; see below.
+
+## Peer-to-peer sync (v0.3) — no external services
+
+- No cloud, no server, no accounts. Devices sync with an always-on home node you own (e.g. a Mac mini) or directly.
+- Channel: `Noise_XX_25519_ChaChaPoly_SHA256` (mutual authentication, forward secrecy, counter nonces → replayed,
+  reordered or modified frames abort the session). Inside it, records stay AES-GCM-encrypted per item.
+- Peers are accepted only if their static key is in the replicated device registry and not revoked (fail closed).
+  Revocation is sticky (cannot be undone by merging an older registry) and rotates the sync key immediately.
+- Pairing: QR / `agentkey-pair:` code with node address, one-time 32-byte secret (Noise psk), node key fingerprint;
+  expires after 10 min, single use. The new device checks the fingerprint before revealing its own identity.
+  Pairing, revocation, backup export and restore require Touch ID / Apple Watch on the device doing them.
+- Home node compromise = compromise of the synced vault contents (it holds the sync keys). Treat it like your main Mac:
+  FileVault, your account only, updates, and do **not** expose port 7373 to the internet — use Tailscale/WireGuard.
+- A revoked device keeps whatever it already decrypted; rotate secrets it may have seen.
+- Encrypted backup: PBKDF2-SHA256 600k over a ≥ 12-char passphrase, AES-256-GCM with the header as AAD.
+- Not yet validated on Apple hardware: Bonjour / Network.framework transports, Keychain + Secure Enclave wrapping of
+  the device identity key (on Linux it is a 0600 file).

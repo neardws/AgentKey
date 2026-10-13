@@ -348,4 +348,4 @@ final class Daemon: @unchecked Sendable {
 
 final class Box<T>: @unchecked Sendable { var value: T? }
 
-public enum AgentKeyVersion { public static let string = "0.1.0" }
+public enum AgentKeyVersion { public static let string = "0.3.0" }

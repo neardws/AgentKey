@@ -1,9 +1,9 @@
 # AgentKey 设计文档
 
-> **人和 Agent 都是一等用户的个人密码管理器：Mac / iPhone / iPad 全端自动填充，iCloud 端到端加密同步，AI Agent 在 Touch ID / Apple Watch 审批下取用并帮你打理保险库。**
-> *A personal password manager for humans and AI agents — AutoFill everywhere on Apple devices, end-to-end encrypted iCloud sync, and agents that use and tidy your vault under Touch ID / Apple Watch approval.*
+> **人和 Agent 都是一等用户的个人密码管理器：Mac / iPhone / iPad 全端自动填充，设备之间点对点端到端加密同步（家中 Mac mini 做常在线同步节点，不用任何云和服务器），AI Agent 在 Touch ID / Apple Watch 审批下取用并帮你打理保险库。**
+> *A personal password manager for humans and AI agents — AutoFill everywhere on Apple devices, end-to-end encrypted peer-to-peer sync between your own devices (an always-on Mac mini as home node — no cloud, no server), and agents that use and tidy your vault under Touch ID / Apple Watch approval.*
 
-本文 Part A 为当前权威设计（2026-10 修订：双用户模型 + 同步 + 迁移 + Agent 维护）；Part B 为早期方案正文（代号 NVault），其中的密钥体系、审批服务、AutoFill、Safari、Passkeys 等细节仍然有效，与 Part A 冲突时以 Part A 和代码为准。
+本文 Part A 为当前权威设计（2026-10 修订：双用户模型 + 迁移 + Agent 维护；2026-10-13 再修订：**完全不依赖外部服务**，同步改为家庭节点 + 点对点，iCloud/CloudKit 降为默认关闭的遗留模块）；Part B 为早期方案正文（代号 NVault；其中 iCloud/CloudKit 同步部分已作废），其中的密钥体系、审批服务、AutoFill、Safari、Passkeys 等细节仍然有效，与 Part A 冲突时以 Part A 和代码为准。
 
 ---
 
@@ -18,9 +18,9 @@
 
 原则：
 
-1. **个人、无服务器**：每个用户独立，数据只在自己的设备和自己的 iCloud 私有数据库里；项目不运营任何后端。
+1. **个人、零外部服务**：数据只在你自己的设备上。没有云、没有服务器、没有账号；项目不运营任何后端，也不依赖 iCloud/CloudKit。同步由你家里常开的一台设备（通常是 Mac mini，“家庭节点”）和设备之间直接完成。
 2. **每台设备都有完整的加密保险库**，离线可用；同步只是交换密文。
-3. **端到端加密**：Apple / iCloud 只看到密文和非敏感同步元数据（记录 ID、Lamport 时钟、设备 ID、删除标记、密钥版本）。
+3. **端到端加密**：设备间链路是 Noise 加密信道，里面传的仍是逐条 AES-GCM 密文记录；网络上（局域网、Tailscale/WireGuard）只能看到加密流量。
 4. **人是最终决策者**：Agent 可以读取元数据、提出建议，但秘密的每次释放、保险库的每次变更都要人确认（生物识别），可部分批准、可撤销、全部审计。
 5. **Agent 默认看不到明文**：`run`（注入子进程）/`totp`/`http`（规划中）优先，`reveal` 默认关闭；导入的条目默认不对 Agent 开放。
 
@@ -39,7 +39,8 @@
                 │            AgentKeyCore（共享 Swift Package，跨平台，Linux 上可测）            │
                 │  密钥体系 · 条目模型 · 加密记录存储 · 3-way 合并 · 导入器 · 健康分析 · TOTP · 生成器  │
                 ▼                                                                      ▼
-        本地加密记录库（SQLite，每条记录 AES-256-GCM）  ⇄  CKSyncEngine  ⇄  iCloud 私有数据库（自定义 Zone，只存密文）
+        本地加密记录库（每条记录 AES-256-GCM）  ⇄  P2P 同步（Noise XX 信道）  ⇄  家庭节点 Mac mini（agentkeyd --sync-node）
+                 传输可插拔：Bonjour _agentkey._tcp（局域网）· TCP over Tailscale/WireGuard（外出）· 可选 Multipeer
 ```
 
 App、扩展、守护进程通过 App Group 共享同一个加密记录库；扩展只做读取（AutoFill 填充后通过共享队列回写 `lastUsedAt`）。
@@ -48,11 +49,11 @@ App、扩展、守护进程通过 App Group 共享同一个加密记录库；扩
 
 - AUK = KDF(主密码) ⊕ HKDF-SHA256(Secret Key, salt=accountID, info="agentkey/2skd/v1")。KDF 现为 PBKDF2-HMAC-SHA256 600k（`PasswordKDF` 抽象），Phase 2 换 Argon2id（m=128 MiB, t=3, p=4；扩展内不跑 Argon2，走 Secure Enclave 快速解锁）。
 - AUK 解封保险库密钥 VK；VK 派生子密钥：`audit`（审计 HMAC）、`health`（健康分析的密码分组 HMAC）、`record`（同步记录，带 keyVersion 以支持轮换）。
-- Secret Key：128 位，`A1-` + Crockford Base32 + 校验位，仅存本机钥匙串（ThisDeviceOnly，不进 iCloud 钥匙串）；新设备通过二维码 / 紧急备份卡加入。
+- Secret Key：128 位，`A1-` + Crockford Base32 + 校验位，仅存本机钥匙串（ThisDeviceOnly，不进 iCloud 钥匙串）。新设备加入同步组时不需要 Secret Key：配对握手把同步密钥加密交给它（见 A5.3）；Secret Key 仍保护每台设备本地的保险库文件（离线备份用单独的备份口令，见 A5.7）。
 
 ## A4. 本地存储：加密记录库（替代 v0.1 的单文件 JSON 信封）
 
-v0.1 使用一个 JSON 信封文件（`vault.akv`），便于原型；Phase 2 起改为 **SQLite 记录库**（App Group 容器内，`NSFileProtectionComplete` / Data Protection），设计为与 CKRecord 一一对应：
+v0.1 使用一个 JSON 信封文件（`vault.akv`），便于原型；Phase 2 起改为 **SQLite 记录库**（App Group 容器内，`NSFileProtectionComplete` / Data Protection），设计为与同步记录 `SyncRecord` 一一对应：
 
 ```sql
 CREATE TABLE meta(key TEXT PRIMARY KEY, value BLOB);          -- accountID, kdf 参数, wrappedVK, deviceID, lamport, engineState
@@ -65,10 +66,10 @@ CREATE TABLE records(
   key_version INTEGER NOT NULL,
   ct          BLOB,                  -- AES-256-GCM(VK_record, item JSON, AAD="agentkey/record|<id>|k<kv>")；墓碑为 NULL
   pending     INTEGER NOT NULL DEFAULT 0,   -- 待上传
-  ck_system   BLOB                   -- CKRecord system fields（change tag）
+  seq         INTEGER NOT NULL       -- 本机变更序号（作为同步 hub 时供对端增量拉取）
 );
-CREATE TABLE bases(                  -- 3-way 合并基线：最后一次与服务器一致的版本
-  id TEXT PRIMARY KEY, lamport INTEGER, device TEXT, deleted INTEGER, ct BLOB);
+CREATE TABLE bases(                  -- 3-way 合并基线：每个对端各自一份（最后一次与该对端一致的版本）
+  peer TEXT, id TEXT, PRIMARY KEY(peer, id), lamport INTEGER, device TEXT, deleted INTEGER, ct BLOB);
 CREATE TABLE search_index(           -- 加密的搜索索引（标题/域名 token 的 HMAC），供 AutoFill 快速匹配
   token_mac BLOB, id TEXT);
 ```
@@ -79,18 +80,76 @@ CREATE TABLE search_index(           -- 加密的搜索索引（标题/域名 to
 - 历史：条目内部保存最近 20 次被替换的秘密值（加密在条目内），用于合并冲突、清理计划与轮换的撤销。
 - 代码现状：`SyncRecord` / `RecordMeta` / `Stamp` / `SyncReplica`（内存参考实现）已实现并测试；SQLite 实现是 Phase 2 工作，必须通过与 `SyncReplica` 相同的测试。
 
-## A5. 同步：CKSyncEngine + 字段级三方合并
+## A5. 同步：家庭节点 + 点对点（不用任何外部服务）
 
-- **传输**：`CKSyncEngine`（iOS 17 / macOS 14+），私有数据库，自定义 Zone `AgentKeyVault`，记录类型 `VaultRecord`，字段 `ct, rev, lamport, device, deleted, kv`。容器 `iCloud.com.neardws.agentkey`。代码：`Sources/AgentKeyCore/Sync/CloudKitSyncAdapter.swift`（骨架，待 Mac 验证）。
-- **时钟**：每台设备一个 Lamport 时钟；收到远端记录时 `observe`。冲突裁决用 `(lamport, deviceID)` 全序。
-- **合并**（`MergeEngine`，已实现 + 测试）：
-  - 以 `bases` 为共同祖先，逐属性三方合并：只有一侧改 → 取该侧；两侧改成相同 → 取之；两侧改成不同 → 较大 Stamp 获胜，**落败的秘密值写入条目历史**，不丢数据，并记录冲突供 UI 提示。
-  - URL、标签、Agent 模式按集合三方合并（两侧的增删都保留）。
-  - 字段按 `field.id` 合并；删除 vs 编辑 → 保留编辑（复活）并提示；删除 vs 未改 → 删除。
-  - 无共同祖先（两台设备离线各自新建同 ID，极少）→ 整条 LWW，落败方进历史。
-- **冲突回路**：上传遇到 `serverRecordChanged` → 取服务器记录合并 → 若结果不同于服务器 → 重新排队上传。
-- **账号变化**：退出 / 切换 Apple ID → 停止同步、清除同步状态，不把保险库静默上传到另一个账号。
-- 测试：随机化 3 设备 × 30 轮编辑/删除/新增，在模拟 CloudKit 的乐观并发服务器上最终收敛。
+> 代码：`Sources/AgentKeyCore/P2P/`（`Noise.swift`、`Transport.swift`、`Identity.swift`、`PeerReplica.swift`、`SyncSession.swift`、`SyncNode.swift`、`Backup.swift`、`AppleTransports.swift`）。
+> 纯 Swift 部分（协议、握手、会话状态机、配对载荷、备份格式、内存 + TCP 传输）在 Linux 上构建并测试；Network.framework / Bonjour / Multipeer 在 `#if canImport` 之后，标 `TODO(mac)`。
+> 旧的 CloudKit 适配器保留为**遗留可选模块**，默认不编译（需 `-DAGENTKEY_LEGACY_CLOUDKIT`）。
+
+### A5.1 拓扑
+
+- **家庭节点（home node）**：一台常开的自有设备（推荐 Mac mini），运行 `agentkeyd --sync-node`，监听 TCP 7373（局域网 + Tailscale/WireGuard），并（TODO(mac)）通过 Bonjour 广播 `_agentkey._tcp`。它和其它设备一样持有完整副本，只是“总在线”。
+- **其它设备**（MacBook、iPhone、iPad）：作为客户端连家庭节点同步（`agentkey sync now`，守护进程每 5 分钟后台同步一次）。协议本身是对称的：任何副本都能当 hub，所以两台设备在没有家庭节点时也可以直接互相同步（例如 Multipeer）。
+- 没有中继、没有账号、没有云。外出时用你自己的 Tailscale / WireGuard 回家；连不上就离线工作，回家后再收敛。
+
+### A5.2 设备身份
+
+- 每台设备一个 **Curve25519 静态密钥**（`DeviceIdentity`）和随机 deviceID。指纹 = Base32(SHA-256("agentkey-fp/1" ‖ pub)[0..20])，分组显示，如 `QVSD-7OYQ-KWZD-…`。
+- 存储：TODO(mac) 钥匙串 ThisDeviceOnly，并用 **Secure Enclave 的 P-256 密钥包裹**（SE 不支持 X25519，所以由 SE 密钥加密保护 X25519 私钥）；Linux / 开发机上是 0600 文件。
+- **TrustState**（设备注册表 + 密钥环）在同步组里复制，按半格合并：设备集合取并集，`revokedAt` 一旦设置就**永久生效**（撤销是粘性的，旧状态无法“取消撤销”）。
+
+### A5.3 配对（二维码）
+
+1. 家庭节点上 `agentkey device pair`（需 Touch ID / Watch 批准）生成一次性载荷 `agentkey-pair:<base64url>`（显示为二维码）：`{vaultID, nodeName, hosts[], port, fingerprint(节点公钥), secret(32 字节一次性), expires(默认 10 分钟)}`。
+2. 新设备扫码 / 粘贴：`agentkey device pair <code>`（同样需批准）。双方跑 **Noise_XX_25519_ChaChaPoly_SHA256 + psk**（一次性 secret 通过 mixKeyAndHash 混入，prologue 绑定 `agentkey-pair/1|vaultID`），实现**双向认证**：
+   - 新设备在发送自己的身份（msg3）**之前**校验对端静态公钥指纹 == 二维码里的指纹，不符即中止（防 MITM / 冒充节点）；
+   - 节点要求对方知道一次性 secret（psk 不对握手直接失败），载荷**单次使用**（无论成败都作废）且有过期时间。
+3. 节点把新设备加入 TrustState，并用 **KeyWrap**（临时 X25519 + HKDF + ChaChaPoly，绑定 `vaultID|keyVersion`）为它包裹每个同步密钥版本；整个 **handover**（TrustState + 密钥）在已认证的 Noise 信道里发送。
+4. 新设备之后用普通同步协议拉全量数据；本地保险库与副本之间通过 **VaultBridge** 双向对账（HMAC 快照，不落明文）。
+
+### A5.4 安全信道
+
+- 同步连接也是 **Noise XX**（prologue `agentkey-sync/1|vaultID`），握手后双方都检查对端公钥在 TrustState 中且**未被撤销**，否则断开（fail-closed）。客户端额外钉住目标设备的指纹。
+- 传输阶段：ChaChaPoly + 递增 64 位计数器 nonce，**重放 / 乱序 / 篡改的帧都会解密失败**并终止会话；每次会话新的临时密钥 → **前向保密**。
+- 首帧是明文模式标签（pair / sync），同时也写进 prologue，被篡改会导致握手失败。帧格式 4 字节长度前缀，最大 8 MiB。
+
+### A5.5 同步协议（与传输无关）
+
+在已有 `MergeEngine` / `SyncRecord` 基础上：
+
+- 每个副本给本地每次变更编号 `seq`（单调递增）。客户端为每个 hub 保存 `cursor[hub]`（已应用到的 hub seq）。
+- 会话：`hello(since=cursor, trust)` → hub 回若干页 `delta(trust, records>since, upTo, more)` → 客户端**整页应用后**才推进 cursor（可恢复、幂等：中断后重来不会丢也不会重复）→ 客户端 `push(records + 各自的 CAS 基线)` → hub 对每条做**比较并交换**：基线等于 hub 当前版本则接受，否则回传 hub 版本作为冲突 → 客户端用 `MergeEngine` 三方合并后再推（最多 8 轮）→ `done(hubSeq)`。
+- 每个对端各自维护合并基线（per-peer base），因此三方合并在多设备下仍然确定。hub 端会话串行化。
+- 线上只有：Noise 加密帧，里面是 `SyncRecord`（逐条 AES-GCM 密文，AAD = `agentkey/record|id|k<keyVersion>`）+ 非敏感元数据（Lamport、设备 ID、删除标记、密钥版本）+ TrustState（公钥、名字、包裹后的密钥）。
+- 合并语义不变：逐属性三方合并、集合合并、删除 vs 编辑保留编辑、落败的秘密值进条目历史。
+- 测试（`P2PTests`、`SyncNodeTests`）：握手成功 / psk 不符 / 指纹不符 / 中间人篡改 / 重放；3 设备经真实协议（内存传输）收敛；同字段冲突确定性收敛；TCP 回环分页同步；撤销；副本落盘无明文；节点 + 两份真实保险库文件经 TCP 配对并双向同步；一次性配对码不可复用。
+
+### A5.6 撤销与密钥轮换
+
+- `agentkey device revoke <设备>`（需批准）：在 TrustState 里标记撤销（粘性），**立即轮换同步密钥**（新 keyVersion = (代数<<32)|随机），新密钥只包裹给仍受信任的设备；所有现存记录用新密钥重新加密并重新打戳，随下次同步扩散。
+- 被撤销设备：所有节点在握手阶段拒绝它；即使拿到新记录也解不开。**它已经解密过的数据无法收回**——撤销后应轮换它可能见过的密码（健康分析会提示）。
+
+### A5.7 加密离线备份
+
+- `agentkey backup export <file>`（需批准）：`.akbackup` = JSON 头 `{format, version, createdAt, createdBy, itemCount, kdf}` + AES-256-GCM 密文；密钥 = PBKDF2-SHA256(600k, 备份口令 ≥ 12 字符)；**AAD 覆盖头部字段**，改头即失败。
+- `agentkey backup restore <file>`（需批准）：口令错误 / 文件被改 → 拒绝；按条目 ID 合并（不存在则新增，备份更新则覆盖）。
+- 备份是脱离所有设备和网络的最后防线（家里失火、全部设备丢失）。
+
+### A5.8 威胁模型（同步部分）
+
+| 威胁 | 后果 | 对策 / 残余风险 |
+|---|---|---|
+| **设备丢失 / 被盗** | 攻击者拿到一台已配对设备 | 本地保险库需主密码 + Secret Key；同步副本用设备身份派生密钥加密（Mac 上 TODO 由 SE/钥匙串保护）。用其它设备 `device revoke` → 握手拒绝 + 密钥轮换；之后的新数据它解不开。残余：设备在解锁状态被拿走时已缓存的数据；撤销后轮换重要密码。 |
+| **配对时中间人** | 冒充家庭节点骗新设备入组，或冒充新设备 | 二维码带节点公钥指纹，新设备在暴露身份前校验；一次性 32 字节 secret 作 Noise psk，不知道就无法完成握手；单次使用 + 10 分钟过期；配对两端都需要生物识别批准。残余：二维码被人拍到并抢先使用 → 合法设备配对失败（单次使用）即可察觉，在节点上 `device list` 核对后撤销。 |
+| **局域网 / 公网窃听、重放、篡改** | 读取或伪造同步流量 | Noise 加密 + 认证；计数器 nonce 拒绝重放；临时密钥前向保密；Bonjour 结果只是提示，仍需指纹匹配。 |
+| **家庭节点被攻破** | 节点持有全部同步密钥和副本 | 节点和你的 Mac 一样敏感：开 FileVault、仅你的账户、强登录密码、保持系统更新、不对公网开放端口（用 Tailscale/WireGuard）。节点无法绕过其它设备的生物识别审批去释放秘密给 Agent，也不能取消撤销；被攻破后从另一台设备撤销它，选一台新节点重新配对。残余：被攻破期间的数据视为泄露。 |
+| **被撤销设备重放旧 TrustState** | 试图“取消撤销” | 撤销粘性合并，旧状态不能覆盖。 |
+| **恶意已配对设备** | 推送垃圾或删除 | 删除只是墓碑 + 历史可恢复；审计记录来源设备；撤销该设备。 |
+| **备份文件泄露** | 离线暴力破解 | PBKDF2 600k + 口令长度下限；建议用生成的长口令单独保存。 |
+
+### A5.9 遗留：CloudKit（默认关闭）
+
+`CloudKitSyncAdapter.swift` 仅在 Apple 平台且编译标志 `AGENTKEY_LEGACY_CLOUDKIT` 打开时编译，未验证、不在路线图内。默认构建不包含任何云组件。
 
 ## A6. 迁移导入（`Importers`，已实现）
 
@@ -159,8 +218,9 @@ CREATE TABLE search_index(           -- 加密的搜索索引（标题/域名 to
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | **Phase 1 — Mac 核心 + Agent 通道** | AgentKeyCore（2SKD、逐条加密、TOTP、生成器）、`agentkeyd` + Touch ID/Watch 审批、CLI、MCP、审计、`--json`、输出脱敏 | ✅ v0.1（Mac 实测中） |
-| **Phase 1.5 — 迁移 + Agent 维护 + 同步模型** | 导入器（1Password/Apple/Chrome/Firefox/Bitwarden/CSV）、健康分析、清理计划、Lamport + 墓碑 + 三方合并、CKSyncEngine 骨架 | ✅ 本次（同步适配器待 Mac 验证） |
-| **Phase 2 — 存储 + 同步落地** | SQLite 加密记录库、CKSyncEngine 实测、Argon2id、Secure Enclave 快速解锁、签名 App + App Group + 钥匙串 ACL | ⏳ |
+| **Phase 1.5 — 迁移 + Agent 维护 + 同步模型** | 导入器（1Password/Apple/Chrome/Firefox/Bitwarden/CSV）、健康分析、清理计划、Lamport + 墓碑 + 三方合并 | ✅ |
+| **Phase 1.6 — 零外部服务同步** | Noise XX 信道、设备身份、二维码配对、家庭节点 `agentkeyd --sync-node`、P2P 增量同步、撤销 + 密钥轮换、加密离线备份、`device`/`sync`/`backup` 命令；CloudKit 降为默认关闭的遗留模块 | ✅ Linux 测试通过；Bonjour/NW 传输、SE 包裹身份密钥待 Mac 验证 |
+| **Phase 2 — 存储 + 同步落地** | SQLite 加密记录库、Bonjour 自动发现 + Multipeer、iOS 后台同步、二维码扫描 UI、Argon2id、Secure Enclave 快速解锁、签名 App + App Group + 钥匙串 ACL | ⏳ |
 | **Phase 3 — 全端人用体验** | iPhone / iPad / Mac App、AutoFill 扩展（密码 + TOTP）、菜单栏快速搜索、导入向导 | ⏳ |
 | **Phase 4 — Passkeys + 浏览器** | Passkeys 提供者、Safari Web 扩展、Chrome 扩展（native messaging） | ⏳ |
 | **Phase 5 — 高级 Agent 能力** | 轮换助手、`http` / `inject` / `fill` 模式、授权（grants）与撤销、iPhone 远程审批、HPKE 加密审计 | ⏳ |
