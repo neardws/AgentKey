@@ -117,6 +117,18 @@ public final class Vault: @unchecked Sendable {
         try save()
     }
 
+    /// Store an item exactly as given (no history/timestamp bookkeeping). Used by the sync bridge,
+    /// where the item already carries merged history from other devices.
+    public func put(_ item: VaultItem) throws {
+        let rev = (file.items.first { $0.id == item.id }?.revision ?? 0) + 1
+        let blob = try KeyHierarchy.seal(try Self.encoder.encode(item), key: vk, aad: Self.itemAAD(file.vaultID, item.id, rev))
+        file.items.removeAll { $0.id == item.id }
+        file.items.append(EncryptedItem(id: item.id, revision: rev, blob: blob))
+        try save()
+    }
+
+    public var vaultID: UUID { file.vaultID }
+
     public func item(id: UUID) throws -> VaultItem? {
         guard let e = file.items.first(where: { $0.id == id }) else { return nil }
         let pt = try KeyHierarchy.open(e.blob, key: vk, aad: Self.itemAAD(file.vaultID, e.id, e.revision))
@@ -172,4 +184,5 @@ public final class Vault: @unchecked Sendable {
 extension Vault {
     /// Read the (unencrypted) account id so the Secret Key can be fetched before unlocking.
     public static func accountID(at url: URL) throws -> UUID { try readFile(url).accountID }
+    public static func vaultID(at url: URL) throws -> UUID { try readFile(url).vaultID }
 }

@@ -1,6 +1,8 @@
-// CloudKit transport (CKSyncEngine, private database, custom zone). Apple platforms only.
-// STATUS: compile-able skeleton — NOT yet validated on a device. See TODO(mac) markers.
-#if canImport(CloudKit)
+// LEGACY / OPTIONAL — OFF BY DEFAULT. AgentKey uses no external services: sync is peer-to-peer
+// via a home node (see P2P/). This CloudKit transport is kept only as an opt-in experiment and is
+// compiled solely when built with `-Xswiftc -DAGENTKEY_LEGACY_CLOUDKIT` on an Apple platform.
+// STATUS: unvalidated skeleton. See TODO(mac) markers.
+#if canImport(CloudKit) && AGENTKEY_LEGACY_CLOUDKIT
 import CloudKit
 import Foundation
 
