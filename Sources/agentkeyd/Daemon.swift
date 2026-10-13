@@ -18,6 +18,9 @@ final class Daemon: @unchecked Sendable {
     lazy var sync: SyncNode? = try? SyncNode(dir: AKPaths.syncDir, deviceName: ProcessInfo.processInfo.environment["AGENTKEY_DEVICE_NAME"] ?? ProcessInfo.processInfo.hostName)
     var syncPort: UInt16 = SyncNode.defaultPort
     var extraHosts: [String] = []
+    /// Bonjour instance name when this node advertises on the LAN (nil = not advertising).
+    var bonjourName: String?
+    var bonjourListener: AnyObject?
 
     /// Reconcile vault file <-> sync replica when the vault is unlocked (no-op when locked).
     @discardableResult
@@ -227,6 +230,9 @@ final class Daemon: @unchecked Sendable {
             case "sync.now":
                 let node = try requireSync()
                 guard node.replica != nil else { throw RPCError(.notFound, SyncNodeError.notInitialized.description) }
+                if Discovery.supported && req.params["discover"] != "false" {
+                    try? node.learnDiscovered(Discovery.browse(timeout: 2).nodes)
+                }
                 let pre = reconcileVault()
                 let res = try node.syncNow()
                 let post = reconcileVault()
@@ -242,6 +248,16 @@ final class Daemon: @unchecked Sendable {
                 return RPCMessage(id: req.id, result: ["peers": try jsonString(peers), "vaultUnlocked": String(pre != nil),
                                                        "toReplica": String((pre?.0 ?? 0) + (post?.0 ?? 0)), "toVault": String((pre?.1 ?? 0) + (post?.1 ?? 0))])
 
+            case "sync.discover":
+                let node = try requireSync()
+                let t = Double(req.params["timeout"] ?? "") ?? 3
+                let r = Discovery.browse(timeout: min(max(t, 0.5), 15))
+                let nodes = Discovery.annotate(r.nodes, trust: node.replica?.trust)
+                if req.params["learn"] != "false" { try? node.learnDiscovered(nodes) }
+                var out = ["nodes": try jsonString(nodes), "supported": String(Discovery.supported)]
+                if let e = r.error { out["error"] = e }
+                return RPCMessage(id: req.id, result: out)
+
             case "device.pair.offer":
                 // Show a one-time pairing code on THIS device (normally the home node). Human-only.
                 let node = try requireSync()
@@ -251,7 +267,12 @@ final class Daemon: @unchecked Sendable {
                     reconcileVault()
                 }
                 try await humanApprove("show a pairing code that lets a new device join this vault", ref: "device_pair_offer", agent: agent, conn: conn, peer: peer)
-                let hosts = (req.params["hosts"].map { $0.split(separator: ",").map(String.init) } ?? []) + extraHosts + LocalAddresses.ipv4()
+                // Bonjour name first (LAN, survives DHCP changes), then explicit hosts, then IPs as fallback.
+                var hosts: [String] = []
+                if let b = bonjourName { hosts.append(SyncEndpoint.bonjourPrefix + b) }
+                if let h = req.params["hosts"] { hosts += h.split(separator: ",").map(String.init) }
+                hosts += extraHosts
+                hosts += LocalAddresses.ipv4()
                 let ttl = TimeInterval(req.params["ttl"].flatMap(Int.init) ?? 600)
                 let p = try node.makeOffer(hosts: hosts, port: syncPort, ttl: ttl)
                 return RPCMessage(id: req.id, result: ["uri": p.uri, "fingerprint": p.fingerprint, "expires": ISO8601DateFormatter().string(from: p.expires),

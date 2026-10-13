@@ -8,9 +8,10 @@ public final class SyncNode: @unchecked Sendable {
     public let dir: URL
     public let identity: DeviceIdentity
     public private(set) var replica: PeerReplica?
-    public private(set) var peers = Peers()
+    public internal(set) var peers = Peers()
     private var offer: PairingPayload?
     private let lock = NSRecursiveLock()
+    func lock2(_ f: () -> Void) { lock.withLock(f) }
 
     public struct Peers: Codable {
         public var homeNode: String?                       // deviceID of the home node
@@ -73,18 +74,19 @@ public final class SyncNode: @unchecked Sendable {
     }
 
     /// Join a sync group with a scanned payload. Tries each advertised host.
-    public func join(_ payload: PairingPayload, connect: (String, UInt16) throws -> FrameTransport = { try TCPTransport.connect(host: $0, port: $1) }) throws -> PeerReplica {
+    public func join(_ payload: PairingPayload, connect: (String) throws -> FrameTransport = { try SyncEndpoint.dial($0, timeout: 10) }) throws -> PeerReplica {
         try lock.withLock {
             guard replica == nil else { throw SyncNodeError.alreadyPaired }
             var last: Error = SyncNodeError.unreachable
-            for h in payload.hosts {
+            let eps = payload.hosts.map { SyncEndpoint.make(host: $0, port: payload.port) }
+            for ep in eps {
                 do {
-                    let t = try connect(h, payload.port)
+                    let t = try connect(ep)
                     try t.send(Data(SecureChannel.proloquePair.utf8))
                     let r = try SyncSession.pair(identity: identity, payload: payload, over: t)
                     guard let hub = r.trust.devices.values.first(where: { $0.fingerprint == payload.fingerprint }) else { throw PairingError.rejected("node missing") }
                     replica = r; peers.homeNode = hub.deviceID
-                    peers.endpoints[hub.deviceID] = payload.hosts.map { "\($0):\(payload.port)" }
+                    peers.endpoints[hub.deviceID] = eps
                     try save(); return r
                 } catch let e as PairingError { throw e }
                 catch { last = error }
@@ -128,15 +130,14 @@ public final class SyncNode: @unchecked Sendable {
     // MARK: client sync
 
     /// Sync with the home node (or every known peer endpoint). Returns per-peer results.
-    public func syncNow(connect: (String, UInt16) throws -> FrameTransport = { try TCPTransport.connect(host: $0, port: $1, timeout: 5) }) throws -> [String: Result<SyncStats, Error>] {
+    public func syncNow(connect: (String) throws -> FrameTransport = { try SyncEndpoint.dial($0, timeout: 5) }) throws -> [String: Result<SyncStats, Error>] {
         guard let r = lock.withLock({ replica }) else { throw SyncNodeError.notInitialized }
         var out: [String: Result<SyncStats, Error>] = [:]
         for (peer, eps) in peers.endpoints.sorted(by: { $0.key < $1.key }) where peer != identity.deviceID.raw {
             var res: Result<SyncStats, Error> = .failure(SyncNodeError.unreachable)
             for ep in eps {
-                guard let i = ep.lastIndex(of: ":"), let port = UInt16(ep[ep.index(after: i)...]) else { continue }
                 do {
-                    let t = try connect(String(ep[..<i]), port)
+                    let t = try connect(ep)
                     try t.send(Data(SecureChannel.prologueSync.utf8))
                     let fp = r.trust.devices[peer]?.fingerprint
                     res = .success(try SyncSession.runClient(r, over: t, pinnedFingerprint: fp)); break
@@ -258,5 +259,103 @@ public enum LocalAddresses {
             p = cur.pointee.ifa_next
         }
         return out
+    }
+}
+
+/// Endpoint strings stored in peers.json and carried in pairing payloads:
+///   "host:port"            plain TCP (LAN IP, Tailscale/WireGuard address or name)
+///   "bonjour:<service>"    Bonjour service `_agentkey._tcp` on the local network (Apple platforms)
+/// Whatever the endpoint, the Noise handshake + pinned fingerprint is the trust anchor; discovery
+/// only finds an address.
+public enum SyncEndpoint {
+    public static let bonjourPrefix = "bonjour:"
+
+    public static func make(host: String, port: UInt16) -> String {
+        host.hasPrefix(bonjourPrefix) ? host : "\(host):\(port)"
+    }
+
+    public static func dial(_ ep: String, timeout: TimeInterval) throws -> FrameTransport {
+        if ep.hasPrefix(bonjourPrefix) {
+            #if canImport(Network)
+            return try NWFrameTransport.connectBonjour(name: String(ep.dropFirst(bonjourPrefix.count)), timeout: timeout)
+            #else
+            throw TransportError.connectFailed("Bonjour is not available on this platform (\(ep))")
+            #endif
+        }
+        guard let i = ep.lastIndex(of: ":"), let port = UInt16(ep[ep.index(after: i)...]) else {
+            throw TransportError.connectFailed("bad endpoint \(ep)")
+        }
+        return try TCPTransport.connect(host: String(ep[..<i]), port: port, timeout: timeout)
+    }
+
+    /// Bonjour instance name for a node: derived from its public key fingerprint only, so the
+    /// advertisement leaks neither the device name nor anything about the vault.
+    public static func bonjourName(fingerprint: String) -> String {
+        "agentkey-" + fingerprint.replacingOccurrences(of: "-", with: "").prefix(8).lowercased()
+    }
+    /// Short fingerprint published in the TXT record (`fp`), compared against pinned fingerprints.
+    public static func shortFingerprint(_ fp: String) -> String { String(fp.replacingOccurrences(of: "-", with: "").prefix(8)) }
+}
+
+/// A node seen via Bonjour (platform-neutral so CLI/JSON code compiles everywhere).
+public struct DiscoveredNode: Codable, Sendable, Equatable {
+    public var name: String
+    public var domain: String
+    public var endpoint: String
+    public var fingerprintPrefix: String?
+    public var protocolVersion: Int?
+    public var interfaces: [String]
+    /// Filled in by the caller: whether this matches a paired device's pinned fingerprint.
+    public var pairedDeviceID: String?
+    public var pairedName: String?
+
+    public init(name: String, domain: String, endpoint: String, fingerprintPrefix: String?, protocolVersion: Int?, interfaces: [String]) {
+        self.name = name; self.domain = domain; self.endpoint = endpoint
+        self.fingerprintPrefix = fingerprintPrefix; self.protocolVersion = protocolVersion; self.interfaces = interfaces
+    }
+}
+
+public enum Discovery {
+    /// Bonjour browse (Apple). Returns [] with `supported == false` elsewhere.
+    public static var supported: Bool {
+        #if canImport(Network)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    public static func browse(timeout: TimeInterval = 3) -> (nodes: [DiscoveredNode], error: String?) {
+        #if canImport(Network)
+        let b = BonjourBrowser(); let n = b.find(timeout: timeout); return (n, b.lastError)
+        #else
+        return ([], "Bonjour discovery is not available on this platform")
+        #endif
+    }
+
+    /// Mark nodes whose advertised short fingerprint matches a paired (non-revoked) device.
+    /// This is display-only; connecting still requires the full fingerprint in the Noise handshake.
+    public static func annotate(_ nodes: [DiscoveredNode], trust: TrustState?) -> [DiscoveredNode] {
+        nodes.map { n in
+            var n = n
+            if let fp = n.fingerprintPrefix, let d = trust?.devices.values.first(where: { $0.revokedAt == nil && SyncEndpoint.shortFingerprint($0.fingerprint) == fp }) {
+                n.pairedDeviceID = d.deviceID; n.pairedName = d.name
+            }
+            return n
+        }
+    }
+}
+
+extension SyncNode {
+    /// Record a Bonjour endpoint for a paired device found on the LAN (tried before host:port next time).
+    public func learnDiscovered(_ nodes: [DiscoveredNode]) throws {
+        let ann = Discovery.annotate(nodes, trust: replica?.trust)
+        var changed = false
+        lock2 { 
+            for n in ann { guard let id = n.pairedDeviceID else { continue }
+                var l = peers.endpoints[id] ?? []
+                if !l.contains(n.endpoint) { l.insert(n.endpoint, at: 0); peers.endpoints[id] = l; changed = true } }
+        }
+        if changed { try save() }
     }
 }

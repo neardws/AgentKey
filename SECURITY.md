@@ -58,5 +58,7 @@ Does **not** protect against (known limitations):
   FileVault, your account only, updates, and do **not** expose port 7373 to the internet — use Tailscale/WireGuard.
 - A revoked device keeps whatever it already decrypted; rotate secrets it may have seen.
 - Encrypted backup: PBKDF2-SHA256 600k over a ≥ 12-char passphrase, AES-256-GCM with the header as AAD.
-- Not yet validated on Apple hardware: Bonjour / Network.framework transports, Keychain + Secure Enclave wrapping of
+- Bonjour advertisement (`_agentkey._tcp`) carries only a short key fingerprint and the protocol version; discovery is
+  untrusted addressing — the full fingerprint is pinned in the handshake. Disable with `--no-bonjour`.
+- Not yet validated on Apple hardware: Bonjour runtime behaviour, Keychain + Secure Enclave wrapping of
   the device identity key (on Linux it is a 0600 file).

@@ -49,7 +49,27 @@ if args.contains("--sync-node") {
     do { tcp = try TCPListener(host: host, port: daemon.syncPort) }
     catch { FileHandle.standardError.write(Data("agentkeyd: sync listener: \(error)\n".utf8)); exit(1) }
     print("agentkeyd sync node \(node.identity.name) fingerprint \(node.identity.fingerprint) on \(host):\(tcp.port)")
-    // TODO(mac): also advertise via Bonjour (_agentkey._tcp) with BonjourSyncListener from AppleTransports.swift.
+    // LAN discovery: advertise _agentkey._tcp via NWListener (Apple only). Disable with --no-bonjour
+    // or AGENTKEY_NO_BONJOUR=1. The instance name and TXT record contain only a short key fingerprint
+    // and the protocol version — no device name or vault information.
+    let noBonjour = args.contains("--no-bonjour") || ["1", "true", "yes"].contains(ProcessInfo.processInfo.environment["AGENTKEY_NO_BONJOUR"]?.lowercased() ?? "")
+    #if canImport(Network)
+    if !noBonjour {
+        let name = SyncEndpoint.bonjourName(fingerprint: node.identity.fingerprint)
+        do {
+            let bl = try BonjourSyncListener(name: name, fingerprint: node.identity.fingerprint) { t in
+                do { print("sync: \(try node.serveConnection(t, prepare: { daemon.reconcileVault() }))"); daemon.reconcileVault() }
+                catch { print("sync: bonjour session failed: \(error)") }
+            }
+            bl.start(log: { print($0) })
+            daemon.bonjourListener = bl
+            daemon.bonjourName = name
+            print("agentkeyd advertising \(Bonjour.serviceType) as \(name)")
+        } catch { print("agentkeyd: bonjour advertising failed (continuing with TCP only): \(error)") }
+    } else { print("agentkeyd: bonjour advertising disabled") }
+    #else
+    if !noBonjour { print("agentkeyd: bonjour not available on this platform; TCP only") }
+    #endif
     Thread {
         node.runListener(tcp, log: { print("sync: \($0)") }, before: { daemon.reconcileVault() }, after: { daemon.reconcileVault() })
     }.start()

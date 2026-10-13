@@ -38,6 +38,7 @@ SYNC (no cloud, no server: your devices + an always-on home node, e.g. a Mac min
   agentkey device list                                      paired devices, fingerprints, last sync
   agentkey device revoke <device-id|name|fingerprint>       human-only; rotates the vault key
   agentkey sync now | status                                sync with the home node now / show state
+  agentkey sync discover [--timeout S] [--local]            list AgentKey nodes advertising _agentkey._tcp on the LAN
   agentkey backup export <file>                             encrypted offline backup (passphrase; $AGENTKEY_BACKUP_PASSPHRASE)
   agentkey backup restore <file>                            human-only; merges items into the vault
 
@@ -504,6 +505,34 @@ case "device", "sync":
         let r = rpc(client(), "device.revoke", ["device": d, "agent": agentLabel()])
         if Out.json { Out.emit(["revoked": ["device": r["device"] ?? "", "keyVersion": Int(r["keyVersion"] ?? "") ?? 0]]) }
         else { print("✅ revoked \(r["device"] ?? d); vault key rotated. New records are unreadable to it; change any secret it may have seen.") }
+    case ("sync", "discover"):
+        // Default: ask agentkeyd (annotates which nodes are paired and remembers their Bonjour endpoint).
+        // --local: browse from this CLI process (no daemon needed; the terminal app may get the Local Network prompt).
+        let timeout = opt("--timeout") ?? "3"
+        var nodes: [[String: Any]] = [], supported = Discovery.supported, error: String?
+        if flag("--local") {
+            let r = Discovery.browse(timeout: Double(timeout) ?? 3)
+            nodes = r.nodes.compactMap { (try? JSONSerialization.jsonObject(with: JSONEncoder().encode($0))) as? [String: Any] }
+            error = r.error
+        } else {
+            let r = rpc(client(), "sync.discover", ["timeout": timeout, "agent": agentLabel()])
+            nodes = (try? JSONSerialization.jsonObject(with: Data((r["nodes"] ?? "[]").utf8))) as? [[String: Any]] ?? []
+            supported = r["supported"] == "true"; error = r["error"]
+        }
+        if Out.json {
+            var o: [String: Any] = ["nodes": nodes, "supported": supported]
+            if let error { o["error"] = error }
+            Out.emit(["discover": o])
+        } else {
+            if !supported { print("Bonjour discovery is not available on this platform") }
+            if nodes.isEmpty { print("no AgentKey nodes found on the local network\(error.map { " (\($0))" } ?? "")") }
+            for n in nodes {
+                let paired = (n["pairedName"] as? String).map { "paired: \($0)" } ?? "not paired"
+                let nm = n["name"] as? String ?? "?", fp = n["fingerprintPrefix"] as? String ?? "?"
+                let ifs = (n["interfaces"] as? [String] ?? []).joined(separator: ",")
+                print("  \(nm)  fp \(fp)…  v\(n["protocolVersion"] ?? "?")  [\(ifs)]  \(paired)")
+            }
+        }
     case ("sync", "now"):
         let r = rpc(client(), "sync.now", ["agent": agentLabel()])
         let peers = (try? JSONSerialization.jsonObject(with: Data((r["peers"] ?? "[]").utf8))) as? [[String: String]] ?? []

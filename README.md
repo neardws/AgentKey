@@ -113,14 +113,15 @@ agentkey plan apply plan-1a2b3c4d --actions a1,a3   # Touch ID / Apple Watch
 ### Sync your devices (no cloud)
 
 ```bash
-# on the Mac mini (home node) — keep agentkeyd running with --sync-node (TCP 7373)
-agentkeyd --sync-node                       # or add --sync-node to the LaunchAgent's ProgramArguments
+# on the Mac mini (home node): TCP 7373 + Bonjour _agentkey._tcp on the LAN
+./Support/install-launchagent.sh --sync-node      # LaunchAgent runs `agentkeyd --sync-node` (add --no-bonjour to disable advertising)
 agentkey device pair --host mini.tailnet.ts.net   # Touch ID → one-time code (QR text) + node fingerprint
 
 # on the new device
 agentkey device pair 'agentkey-pair:eyJ…'   # verifies the node fingerprint, receives the vault key encrypted
 agentkey sync now                           # also runs every 5 min in the background
 agentkey sync status --json
+agentkey sync discover --json               # AgentKey nodes on this LAN (Bonjour), marked paired / not paired
 agentkey device list
 agentkey device revoke <id|name|fingerprint> # lost device: blocked at handshake + vault key rotated
 
@@ -131,6 +132,18 @@ agentkey backup restore ~/agentkey-2026-10.akbackup
 
 Pairing, revocation, backup export and restore all require Touch ID / Apple Watch. Agents get none of these as MCP tools.
 Keep the home node's port off the public internet; reach it from outside via Tailscale/WireGuard.
+
+**LAN discovery (Bonjour):** the home node advertises `_agentkey._tcp` with instance name `agentkey-<8 chars of its key
+fingerprint>` and TXT `v=<protocol>`, `fp=<8-char fingerprint>` only — no device name, no vault info. Pairing codes list
+`bonjour:<name>` first and fall back to `host:port` (LAN IPs, `--host` names). Discovery only finds an address: every
+connection still pins the node's full fingerprint in the Noise handshake, so a spoofed advertisement gets nowhere.
+Disable with `agentkeyd --no-bonjour` or `AGENTKEY_NO_BONJOUR=1`.
+
+**macOS Local Network prompt:** SwiftPM-built CLI binaries have no Info.plist, so macOS attributes their LAN access to the
+*responsible* app. `agentkeyd` started by the LaunchAgent gets its own entry; `agentkey sync discover --local` or
+`agentkeyd` run from a shell may trigger the prompt for **your terminal app** (Terminal / iTerm / Ghostty). Allow it in
+System Settings → Privacy & Security → Local Network. The App target needs `NSLocalNetworkUsageDescription` and
+`NSBonjourServices` — see `App/AgentKeyApp/Info.plist.template`.
 
 MCP tools: `list_items`, `run_with_secret`, `get_totp`, `get_secret` (off by default), `vault_health`,
 `propose_cleanup`, `get_plan_status`. There is deliberately no tool to apply a plan.
@@ -163,7 +176,7 @@ Set the client's tool timeout ≥ 90 s — approvals wait up to 60 s.
 |---|---|---|
 | 1 | Mac core + agent channel: crypto, vault, `agentkeyd` Touch ID/Watch approvals, CLI, MCP, audit, `--json`, redaction | ✅ v0.1 |
 | 1.5 | Importers, vault health + cleanup plans, sync model (Lamport, tombstones, 3-way merge) | ✅ v0.2 |
-| 1.6 | No external services: home-node + P2P sync (Noise XX, QR pairing, revocation + key rotation), encrypted backup, `device`/`sync`/`backup` CLI; CloudKit demoted to an off-by-default legacy module | ✅ v0.3 (Bonjour/NW transports: Mac validation pending) |
+| 1.6 | No external services: home-node + P2P sync (Noise XX, QR pairing, revocation + key rotation), encrypted backup, `device`/`sync`/`backup` CLI; CloudKit demoted to an off-by-default legacy module | ✅ v0.3 (Bonjour discovery: Mac runtime validation pending) |
 | 2 | Encrypted SQLite record store, Bonjour discovery + Multipeer, iOS background sync, QR scanner UI, Argon2id, Secure Enclave unlock, signed app + App Group | ⏳ |
 | 3 | iPhone / iPad / Mac apps, AutoFill extension (passwords + TOTP), menu-bar quick search, import wizard | ⏳ |
 | 4 | Passkeys provider, Safari web extension, Chrome extension | ⏳ |
@@ -192,6 +205,7 @@ Agent 可以"使用"你的密码和 API Key，但每一次释放都必须由你�
 
 - **家庭节点**：Mac mini 上运行 `agentkeyd --sync-node`（TCP 7373，局域网 / Tailscale / WireGuard）。
 - **配对**：节点上 `agentkey device pair` 显示一次性二维码（含节点地址、一次性密钥、节点公钥指纹，10 分钟过期、单次有效）；新设备 `agentkey device pair <码>`。Noise XX + psk 双向认证，新设备先核对指纹再暴露身份；保险库同步密钥在加密信道里交给新设备。
+- **局域网发现**：家庭节点通过 Bonjour 广播 `_agentkey._tcp`（实例名 `agentkey-<指纹前 8 位>`，TXT 只有协议版本和短指纹，不含设备名或保险库信息）；`agentkey sync discover --json` 列出局域网内的节点。配对码优先写 `bonjour:<名字>`，失败再回退 `host:port`。发现只提供地址，信任仍由 Noise 握手中的完整指纹决定。`--no-bonjour` / `AGENTKEY_NO_BONJOUR=1` 可关闭广播。macOS 上从终端运行的 SwiftPM 命令行程序可能会让**终端 App** 弹出“本地网络”权限请求，在“系统设置 → 隐私与安全性 → 本地网络”里允许即可。
 - **同步**：`agentkey sync now | status --json`，后台每 5 分钟一次；增量、可断点续传、幂等，线上只有加密记录；冲突用三方合并，落败的秘密进条目历史。
 - **丢失设备**：`agentkey device revoke`，所有设备握手时拒绝它，并立即轮换保险库同步密钥。
 - **离线备份**：`agentkey backup export|restore`，备份口令 + AES-GCM 加密文件。

@@ -1,7 +1,7 @@
 // Apple-only transports for P2P sync. Same FrameTransport contract as TCPTransport
 // (4-byte big-endian length + frame); the Noise channel runs on top, so these only move bytes.
-// STATUS: written against the Network.framework / MultipeerConnectivity APIs but NOT compiled or
-// run on a Mac yet — everything here is TODO(mac). Linux builds use TCPTransport/TCPListener.
+// STATUS: compiles on macOS (Xcode 26.2); runtime behaviour still to be verified on the Mac mini.
+// Linux builds use TCPTransport/TCPListener only.
 #if canImport(Network)
 import Foundation
 import Network
@@ -9,9 +9,10 @@ import Network
 public enum Bonjour {
     /// Service type advertised by the home node (and by any device that serves sync).
     public static let serviceType = "_agentkey._tcp"
-    /// TXT record carries only non-secret routing hints: protocol version + node fingerprint prefix.
+    /// TXT record carries only non-secret routing hints: protocol version + short node fingerprint.
+    /// No device name, vault id or item count.
     public static func txt(fingerprint: String) -> NWTXTRecord {
-        var t = NWTXTRecord(); t["v"] = "1"; t["fp"] = String(fingerprint.prefix(9)); return t
+        var t = NWTXTRecord(); t["v"] = String(SyncSession.protocolVersion); t["fp"] = SyncEndpoint.shortFingerprint(fingerprint); return t
     }
 }
 
@@ -22,6 +23,11 @@ public final class NWFrameTransport: FrameTransport, @unchecked Sendable {
     public var peerDescription: String { "\(conn.endpoint)" }
 
     public init(_ conn: NWConnection) { self.conn = conn }
+
+    /// Connect to a Bonjour service by instance name; Network.framework resolves it.
+    public static func connectBonjour(name: String, timeout: TimeInterval = 10) throws -> NWFrameTransport {
+        try connect(.service(name: name, type: Bonjour.serviceType, domain: "local.", interface: nil), timeout: timeout)
+    }
 
     public static func connect(_ endpoint: NWEndpoint, timeout: TimeInterval = 10) throws -> NWFrameTransport {
         let t = NWFrameTransport(NWConnection(to: endpoint, using: .tcp))
@@ -77,31 +83,64 @@ public final class NWFrameTransport: FrameTransport, @unchecked Sendable {
 /// add NSLocalNetworkUsageDescription + NSBonjourServices (_agentkey._tcp) to the app Info.plist.
 public final class BonjourSyncListener: @unchecked Sendable {
     let listener: NWListener
-    public init(name: String, port: UInt16, fingerprint: String, onConnection: @escaping (FrameTransport) -> Void) throws {
-        listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: port) ?? .any)
+    /// `port` 0 = any free port (the TCP listener for Tailscale/WireGuard keeps the fixed port).
+    public init(name: String, port: UInt16 = 0, fingerprint: String, onConnection: @escaping (FrameTransport) -> Void) throws {
+        listener = try port == 0 ? NWListener(using: .tcp) : NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: port) ?? .any)
         listener.service = NWListener.Service(name: name, type: Bonjour.serviceType, txtRecord: Bonjour.txt(fingerprint: fingerprint))
         listener.newConnectionHandler = { c in
             let t = NWFrameTransport(c)
             DispatchQueue.global().async { if (try? t.start(timeout: 10)) != nil { onConnection(t) } }
         }
     }
-    public func start() { listener.start(queue: DispatchQueue(label: "agentkey.bonjour")) }
+    public func start(log: @escaping (String) -> Void = { _ in }) {
+        listener.stateUpdateHandler = { st in
+            switch st {
+            case .ready: log("bonjour: advertising \(Bonjour.serviceType) on port \(self.listener.port?.rawValue ?? 0)")
+            case .failed(let e): log("bonjour: listener failed: \(e)")
+            case .waiting(let e): log("bonjour: waiting (Local Network permission?): \(e)")
+            default: break
+            }
+        }
+        listener.start(queue: DispatchQueue(label: "agentkey.bonjour"))
+    }
     public func cancel() { listener.cancel() }
 }
 
 /// Browse for home nodes on the LAN. Results are only *hints*: the Noise handshake still pins the
 /// node's static key fingerprint, so a spoofed Bonjour advertisement cannot impersonate it.
-/// TODO(mac): verify on device.
 public final class BonjourBrowser: @unchecked Sendable {
-    let browser = NWBrowser(for: .bonjourWithTXTRecord(type: Bonjour.serviceType, domain: nil), using: .tcp)
     public init() {}
-    public func find(timeout: TimeInterval = 3) -> [NWEndpoint] {
-        let sem = DispatchSemaphore(value: 0); var found: [NWEndpoint] = []
-        browser.browseResultsChangedHandler = { results, _ in found = results.map(\.endpoint) }
+    public func find(timeout: TimeInterval = 3) -> [DiscoveredNode] {
+        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: Bonjour.serviceType, domain: nil), using: .tcp)
+        let lock = NSLock(); var found: [String: DiscoveredNode] = [:]; var failure: String?
+        browser.stateUpdateHandler = { st in
+            if case .failed(let e) = st { lock.withLock { failure = "\(e)" } }
+            if case .waiting(let e) = st { lock.withLock { failure = "\(e)" } }
+        }
+        browser.browseResultsChangedHandler = { results, _ in
+            lock.withLock {
+                found = [:]
+                for r in results {
+                    guard case .service(let name, _, let domain, _) = r.endpoint else { continue }
+                    var fp: String?, v: String?
+                    if case .bonjour(let txt) = r.metadata { fp = txt["fp"]; v = txt["v"] }
+                    let ifs = r.interfaces.map(\.name)
+                    var n = found[name] ?? DiscoveredNode(name: name, domain: domain, endpoint: SyncEndpoint.bonjourPrefix + name,
+                                                          fingerprintPrefix: fp, protocolVersion: v.flatMap(Int.init), interfaces: [])
+                    n.interfaces = Array(Set(n.interfaces + ifs)).sorted()
+                    found[name] = n
+                }
+            }
+        }
         browser.start(queue: DispatchQueue(label: "agentkey.browse"))
-        _ = sem.wait(timeout: .now() + timeout)
-        browser.cancel(); return found
+        Thread.sleep(forTimeInterval: timeout)
+        browser.cancel()
+        return lock.withLock {
+            if found.isEmpty, let failure { lastError = failure }
+            return found.values.sorted { $0.name < $1.name }
+        }
     }
+    public private(set) var lastError: String?
 }
 #endif
 

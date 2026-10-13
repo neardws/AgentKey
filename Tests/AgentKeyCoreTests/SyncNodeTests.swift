@@ -54,4 +54,43 @@ final class SyncNodeTests: XCTestCase {
         XCTAssertEqual(again.identity.fingerprint, laptop.identity.fingerprint)
         XCTAssertEqual(again.replica?.liveItems.count, 1)
     }
+
+    func testEndpointsAndBonjourFallbackToTCP() throws {
+        XCTAssertEqual(SyncEndpoint.make(host: "10.0.0.2", port: 7373), "10.0.0.2:7373")
+        XCTAssertEqual(SyncEndpoint.make(host: "bonjour:agentkey-abcd1234", port: 7373), "bonjour:agentkey-abcd1234")
+        let id = DeviceIdentity(name: "Neil's Mac mini")
+        let bn = SyncEndpoint.bonjourName(fingerprint: id.fingerprint)
+        XCTAssertTrue(bn.hasPrefix("agentkey-")); XCTAssertEqual(bn.count, 17)
+        XCTAssertFalse(bn.lowercased().contains("neil") || bn.contains("mini"), "no device name leaks")
+        XCTAssertThrowsError(try SyncEndpoint.dial("nonsense", timeout: 1))
+
+        // pairing payload lists the bonjour name first; on Linux it fails and we fall back to host:port
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ak-bj-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let node = try SyncNode(dir: root.appendingPathComponent("n"), deviceName: "node")
+        _ = try node.initHome(vaultID: UUID())
+        let l = try TCPListener(host: "127.0.0.1", port: 0); defer { l.close() }
+        let done = expectation(description: "served")
+        Thread { if let t = try? l.accept() { _ = try? node.serveConnection(t) }; done.fulfill() }.start()
+        let offer = try node.makeOffer(hosts: [SyncEndpoint.bonjourPrefix + SyncEndpoint.bonjourName(fingerprint: node.identity.fingerprint), "127.0.0.1"], port: l.port)
+        let dev = try SyncNode(dir: root.appendingPathComponent("d"), deviceName: "dev")
+        var tried: [String] = []
+        _ = try dev.join(offer) { ep in tried.append(ep)
+            if ep.hasPrefix(SyncEndpoint.bonjourPrefix) { throw TransportError.connectFailed("no bonjour in test") }
+            return try SyncEndpoint.dial(ep, timeout: 5) }
+        wait(for: [done], timeout: 10)
+        XCTAssertEqual(tried.count, 2)
+        XCTAssertTrue(dev.peers.endpoints.values.first?.first?.hasPrefix("bonjour:") ?? false, "bonjour endpoint remembered first")
+
+        // discovery annotation: only a matching short fingerprint of a trusted device counts as paired
+        let hub = dev.replica!.trust.devices.values.first { $0.isHomeNode == true }!
+        let seen = [DiscoveredNode(name: "agentkey-x", domain: "local.", endpoint: "bonjour:agentkey-x", fingerprintPrefix: SyncEndpoint.shortFingerprint(hub.fingerprint), protocolVersion: 1, interfaces: ["en0"]),
+                    DiscoveredNode(name: "agentkey-evil", domain: "local.", endpoint: "bonjour:agentkey-evil", fingerprintPrefix: "AAAAAAAA", protocolVersion: 1, interfaces: [])]
+        let ann = Discovery.annotate(seen, trust: dev.replica!.trust)
+        XCTAssertEqual(ann[0].pairedDeviceID, hub.deviceID); XCTAssertNil(ann[1].pairedDeviceID)
+        try dev.learnDiscovered(seen)
+        XCTAssertEqual(dev.peers.endpoints[hub.deviceID]?.first, "bonjour:agentkey-x")
+        XCTAssertFalse(dev.peers.endpoints.values.joined().contains("bonjour:agentkey-evil"))
+        if !Discovery.supported { XCTAssertTrue(Discovery.browse(timeout: 0.1).nodes.isEmpty) }
+    }
 }

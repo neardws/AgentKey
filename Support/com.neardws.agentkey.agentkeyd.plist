@@ -5,6 +5,8 @@
   which replaces __AGENTKEYD__ and __HOME__ and runs `launchctl bootstrap gui/$(id -u)`.
   LimitLoadToSessionType=Aqua keeps it inside the logged-in GUI session; LocalAuthentication
   cannot show the Touch ID / Apple Watch sheet from SSH or a system daemon.
+  `install-launchagent.sh` with the sync-node option inserts the sync-node argument here (home node:
+  TCP 7373 + Bonjour _agentkey._tcp); the no-bonjour option disables LAN advertising.
 -->
 <plist version="1.0">
 <dict>
@@ -13,6 +15,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>__AGENTKEYD__</string>
+        <!--__SYNC_NODE_ARGS__-->
     </array>
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>

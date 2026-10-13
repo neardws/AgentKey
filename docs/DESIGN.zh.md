@@ -88,7 +88,7 @@ CREATE TABLE search_index(           -- 加密的搜索索引（标题/域名 to
 
 ### A5.1 拓扑
 
-- **家庭节点（home node）**：一台常开的自有设备（推荐 Mac mini），运行 `agentkeyd --sync-node`，监听 TCP 7373（局域网 + Tailscale/WireGuard），并（TODO(mac)）通过 Bonjour 广播 `_agentkey._tcp`。它和其它设备一样持有完整副本，只是“总在线”。
+- **家庭节点（home node）**：一台常开的自有设备（推荐 Mac mini），运行 `agentkeyd --sync-node`，监听 TCP 7373（局域网 + Tailscale/WireGuard），并通过 NWListener 在局域网广播 Bonjour `_agentkey._tcp`（独立端口；实例名 `agentkey-<指纹前 8 位>`，TXT 只有 `v` 协议版本与 `fp` 短指纹，不泄露设备名 / 保险库信息；`--no-bonjour` 或 `AGENTKEY_NO_BONJOUR=1` 关闭）。客户端用 NWBrowser 发现（`agentkey sync discover`），按短指纹与已配对设备对应后记住 `bonjour:<名字>` 端点，下次优先使用，失败回退 `host:port`。发现只是寻址，信任锚仍是 Noise 握手中钉住的完整指纹。它和其它设备一样持有完整副本，只是“总在线”。
 - **其它设备**（MacBook、iPhone、iPad）：作为客户端连家庭节点同步（`agentkey sync now`，守护进程每 5 分钟后台同步一次）。协议本身是对称的：任何副本都能当 hub，所以两台设备在没有家庭节点时也可以直接互相同步（例如 Multipeer）。
 - 没有中继、没有账号、没有云。外出时用你自己的 Tailscale / WireGuard 回家；连不上就离线工作，回家后再收敛。
 
@@ -100,7 +100,7 @@ CREATE TABLE search_index(           -- 加密的搜索索引（标题/域名 to
 
 ### A5.3 配对（二维码）
 
-1. 家庭节点上 `agentkey device pair`（需 Touch ID / Watch 批准）生成一次性载荷 `agentkey-pair:<base64url>`（显示为二维码）：`{vaultID, nodeName, hosts[], port, fingerprint(节点公钥), secret(32 字节一次性), expires(默认 10 分钟)}`。
+1. 家庭节点上 `agentkey device pair`（需 Touch ID / Watch 批准）生成一次性载荷 `agentkey-pair:<base64url>`（显示为二维码）：`{vaultID, nodeName, hosts[]（优先 `bonjour:<名字>`，再是 IP / Tailscale 名）, port, fingerprint(节点公钥), secret(32 字节一次性), expires(默认 10 分钟)}`。
 2. 新设备扫码 / 粘贴：`agentkey device pair <code>`（同样需批准）。双方跑 **Noise_XX_25519_ChaChaPoly_SHA256 + psk**（一次性 secret 通过 mixKeyAndHash 混入，prologue 绑定 `agentkey-pair/1|vaultID`），实现**双向认证**：
    - 新设备在发送自己的身份（msg3）**之前**校验对端静态公钥指纹 == 二维码里的指纹，不符即中止（防 MITM / 冒充节点）；
    - 节点要求对方知道一次性 secret（psk 不对握手直接失败），载荷**单次使用**（无论成败都作废）且有过期时间。

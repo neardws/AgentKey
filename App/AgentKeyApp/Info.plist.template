@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Keys to merge into the AgentKey app target's Info.plist (Xcode: target → Info → Custom Properties,
+  or set INFOPLIST_FILE to a copy of this file). Required for LAN sync discovery on iOS/iPadOS/macOS:
+  without NSBonjourServices the system refuses to browse/advertise _agentkey._tcp, and without
+  NSLocalNetworkUsageDescription the Local Network permission prompt cannot be shown.
+-->
+<plist version="1.0">
+<dict>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>AgentKey syncs your vault directly between your own devices on this network (no cloud). It looks for your AgentKey home node, e.g. your Mac mini.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_agentkey._tcp</string>
+    </array>
+</dict>
+</plist>
