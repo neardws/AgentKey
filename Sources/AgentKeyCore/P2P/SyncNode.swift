@@ -140,7 +140,10 @@ public final class SyncNode: @unchecked Sendable {
                     try t.send(Data(SecureChannel.prologueSync.utf8))
                     let fp = r.trust.devices[peer]?.fingerprint
                     res = .success(try SyncSession.runClient(r, over: t, pinnedFingerprint: fp)); break
-                } catch { res = .failure(error) }
+                } catch let e as TransportError {
+                    if case .failure(let prev) = res, !(prev is TransportError || prev is SyncNodeError) { continue }  // keep the meaningful error
+                    res = .failure(e)
+                } catch { res = .failure(error); break }   // reached the peer: auth/protocol error is the answer
             }
             out[peer] = res
         }
@@ -232,5 +235,28 @@ public enum SyncNodeError: Error, CustomStringConvertible {
         case .unreachable: return "no peer endpoint reachable"
         case .cannotRevokeSelf: return "cannot revoke this device from itself"
         }
+    }
+}
+
+public enum LocalAddresses {
+    /// Non-loopback IPv4 addresses of this machine (for pairing payloads). Includes Tailscale/WireGuard
+    /// interfaces if up; users can add hostnames (e.g. a MagicDNS name) with `--host`.
+    public static func ipv4() -> [String] {
+        var out: [String] = []
+        var ifa: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifa) == 0, let first = ifa else { return out }
+        defer { freeifaddrs(ifa) }
+        var p: UnsafeMutablePointer<ifaddrs>? = first
+        while let cur = p {
+            if let sa = cur.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) || Int32(sa.pointee.sa_family) == AF_INET {
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(sa, socklen_t(MemoryLayout<sockaddr_in>.size), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                    let s = String(cString: host)
+                    if !s.hasPrefix("127.") && !out.contains(s) { out.append(s) }
+                }
+            }
+            p = cur.pointee.ifa_next
+        }
+        return out
     }
 }

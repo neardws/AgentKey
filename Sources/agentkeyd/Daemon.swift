@@ -14,6 +14,43 @@ final class Daemon: @unchecked Sendable {
     private var vault: Vault?
     private var audit: AuditLog?
     let startedAt = Date()
+    /// P2P sync runtime (identity + replica under AKPaths.home/sync). nil if it failed to load.
+    lazy var sync: SyncNode? = try? SyncNode(dir: AKPaths.syncDir, deviceName: ProcessInfo.processInfo.environment["AGENTKEY_DEVICE_NAME"] ?? ProcessInfo.processInfo.hostName)
+    var syncPort: UInt16 = SyncNode.defaultPort
+    var extraHosts: [String] = []
+
+    /// Reconcile vault file <-> sync replica when the vault is unlocked (no-op when locked).
+    @discardableResult
+    func reconcileVault() -> (Int, Int)? {
+        guard let node = sync, node.replica != nil else { return nil }
+        return try? withVault { try node.reconcile(vault: $0) }
+    }
+
+    func requireSync() throws -> SyncNode {
+        guard let n = sync else { throw RPCError(.internalError, "sync state could not be loaded from \(AKPaths.syncDir.path)") }
+        return n
+    }
+
+    /// Human-only approval (Touch ID / Apple Watch) for sync/device/backup operations.
+    func humanApprove(_ reason: String, ref: String, agent: String, conn: UnixConnection, peer: (uid: UInt32, pid: Int32?)) async throws {
+        let code = PromptSanitizer.correlationCode()
+        log("\(ref)_request", agent: agent, ref: ref, code: code, detail: reason, peer: peer)
+        try? conn.send(RPCMessage(id: nil, method: "progress", params: ["state": "awaiting_approval", "code": code, "ref": ref,
+            "hint": "Approve: \(reason) — Touch ID or Apple Watch"]))
+        var areq = ApprovalRequest(agent: agent, secretName: ref, mode: .fill, code: code, command: nil)
+        areq.customReason = reason
+        do { try await coordinator.approve(areq, timeout: 60) }
+        catch let e as ApprovalError {
+            log("\(ref)_denied", agent: agent, ref: ref, code: code, detail: e.description, peer: peer)
+            throw RPCError(e.isDenied ? .userDenied : .noApprover, e.description)
+        }
+        log("\(ref)_approved", agent: agent, ref: ref, code: code, peer: peer)
+    }
+
+    func jsonString<T: Encodable>(_ v: T) throws -> String {
+        let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601; e.outputFormatting = .sortedKeys
+        return String(decoding: try e.encode(v), as: UTF8.self)
+    }
 
     func withVault<T>(_ f: (Vault) throws -> T) throws -> T {
         try lock.withLock {
@@ -181,6 +218,94 @@ final class Daemon: @unchecked Sendable {
                 }
                 return RPCMessage(id: req.id, result: ["plan": String(decoding: try Vault.encoder.encode(plan), as: UTF8.self),
                                                        "changed": String(res.1), "purged": String(res.2)])
+
+            // MARK: P2P sync (no external services; see docs/DESIGN.zh.md A5)
+            case "sync.status", "device.list":
+                let node = try requireSync()
+                return RPCMessage(id: req.id, result: ["status": try jsonString(node.status())])
+
+            case "sync.now":
+                let node = try requireSync()
+                guard node.replica != nil else { throw RPCError(.notFound, SyncNodeError.notInitialized.description) }
+                let pre = reconcileVault()
+                let res = try node.syncNow()
+                let post = reconcileVault()
+                var peers: [[String: String]] = []
+                for (p, r) in res.sorted(by: { $0.key < $1.key }) {
+                    let name = node.replica?.trust.devices[p]?.name ?? p
+                    switch r {
+                    case .success(let s): peers.append(["device": p, "name": name, "ok": "true", "received": String(s.received), "sent": String(s.sent), "conflicts": String(s.conflicts)])
+                    case .failure(let e): peers.append(["device": p, "name": name, "ok": "false", "error": "\(e)"])
+                    }
+                }
+                log("sync_now", agent: agent, detail: "\(peers.count) peer(s)", peer: peer)
+                return RPCMessage(id: req.id, result: ["peers": try jsonString(peers), "vaultUnlocked": String(pre != nil),
+                                                       "toReplica": String((pre?.0 ?? 0) + (post?.0 ?? 0)), "toVault": String((pre?.1 ?? 0) + (post?.1 ?? 0))])
+
+            case "device.pair.offer":
+                // Show a one-time pairing code on THIS device (normally the home node). Human-only.
+                let node = try requireSync()
+                if node.replica == nil {
+                    guard let vid = try? Vault.vaultID(at: AKPaths.vault) else { throw RPCError(.notFound, "no vault; run `agentkey init` first") }
+                    _ = try node.initHome(vaultID: vid)
+                    reconcileVault()
+                }
+                try await humanApprove("show a pairing code that lets a new device join this vault", ref: "device_pair_offer", agent: agent, conn: conn, peer: peer)
+                let hosts = (req.params["hosts"].map { $0.split(separator: ",").map(String.init) } ?? []) + extraHosts + LocalAddresses.ipv4()
+                let ttl = TimeInterval(req.params["ttl"].flatMap(Int.init) ?? 600)
+                let p = try node.makeOffer(hosts: hosts, port: syncPort, ttl: ttl)
+                return RPCMessage(id: req.id, result: ["uri": p.uri, "fingerprint": p.fingerprint, "expires": ISO8601DateFormatter().string(from: p.expires),
+                                                       "hosts": p.hosts.joined(separator: ","), "port": String(p.port)])
+
+            case "device.pair.join":
+                let node = try requireSync()
+                guard let uri = req.params["uri"], let payload = try? PairingPayload(uri: uri) else { throw RPCError(.usage, "invalid pairing code") }
+                guard let vid = try? Vault.vaultID(at: AKPaths.vault) else { throw RPCError(.notFound, "no local vault; run `agentkey init` first") }
+                _ = vid   // local vault id may differ from the group's; the bridge merges items by id
+                try await humanApprove("join the sync group of \(PromptSanitizer.clean(payload.nodeName, max: 40)) (fingerprint \(payload.fingerprint))", ref: "device_pair_join", agent: agent, conn: conn, peer: peer)
+                do { _ = try node.join(payload) } catch { throw RPCError(.userDenied, "pairing failed: \(error)") }
+                let r = reconcileVault()
+                _ = try? node.syncNow(); reconcileVault()
+                log("device_paired", agent: agent, ref: payload.fingerprint, peer: peer)
+                return RPCMessage(id: req.id, result: ["ok": "true", "deviceID": node.identity.deviceID.raw, "fingerprint": node.identity.fingerprint,
+                                                       "vaultUnlocked": String(r != nil)])
+
+            case "device.revoke":
+                let node = try requireSync()
+                guard let q = req.params["device"], let st = Optional(node.status()),
+                      let d = st.devices.first(where: { $0.deviceID == q || $0.deviceID.hasPrefix(q.lowercased()) || $0.name == q || $0.fingerprint.replacingOccurrences(of: "-", with: "").hasPrefix(q.uppercased().replacingOccurrences(of: "-", with: "")) })
+                else { throw RPCError(.notFound, "no such device") }
+                try await humanApprove("revoke device \(d.name) (\(d.fingerprint)) and rotate the vault key", ref: "device_revoke", agent: agent, conn: conn, peer: peer)
+                do { try node.revoke(d.deviceID) } catch { throw RPCError(.usage, "\(error)") }
+                return RPCMessage(id: req.id, result: ["ok": "true", "device": d.deviceID, "keyVersion": String(node.status().keyVersion)])
+
+            case "backup.export":
+                guard let path = req.params["path"], let pass = req.params["passphrase"] else { throw RPCError(.usage, "path and passphrase required") }
+                guard pass.count >= 12 else { throw RPCError(.usage, BackupError.weakPassphrase.description) }
+                _ = try withVault { _ in () }
+                try await humanApprove("export an encrypted backup of the whole vault to \(PromptSanitizer.clean(path, max: 80))", ref: "backup_export", agent: agent, conn: conn, peer: peer)
+                let items = try withVault { try $0.items() }
+                let blob = try BackupFile.create(items: items, trust: sync?.replica?.trust, passphrase: pass, createdBy: ProcessInfo.processInfo.hostName)
+                guard FileManager.default.createFile(atPath: path, contents: blob, attributes: [.posixPermissions: 0o600]) else { throw RPCError(.usage, "cannot write \(path)") }
+                return RPCMessage(id: req.id, result: ["ok": "true", "path": path, "items": String(items.count)])
+
+            case "backup.restore":
+                guard let path = req.params["path"], let pass = req.params["passphrase"] else { throw RPCError(.usage, "path and passphrase required") }
+                guard let data = FileManager.default.contents(atPath: path) else { throw RPCError(.notFound, "cannot read \(path)") }
+                _ = try withVault { _ in () }
+                let r: (items: [VaultItem], trust: TrustState?, header: BackupFile)
+                do { r = try BackupFile.restore(data, passphrase: pass) } catch { throw RPCError(.userDenied, "\(error)") }
+                try await humanApprove("restore \(r.items.count) item(s) from backup made \(ISO8601DateFormatter().string(from: r.header.createdAt))", ref: "backup_restore", agent: agent, conn: conn, peer: peer)
+                let n = try withVault { v -> (Int, Int) in
+                    var added = 0, updated = 0
+                    for i in r.items {
+                        if let cur = try v.item(id: i.id) { if cur.updatedAt < i.updatedAt { try v.put(i); updated += 1 } }
+                        else { try v.put(i); added += 1 }
+                    }
+                    return (added, updated)
+                }
+                reconcileVault()
+                return RPCMessage(id: req.id, result: ["ok": "true", "added": String(n.0), "updated": String(n.1), "inBackup": String(r.items.count)])
 
             case "audit.verify":
                 let k = lock.withLock { vault?.auditKey }

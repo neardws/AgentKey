@@ -18,5 +18,6 @@ public enum AKPaths {
     public static var socket: URL { home.appendingPathComponent("agent.sock") }
     public static var audit: URL { home.appendingPathComponent("audit.jsonl") }
     public static var policy: URL { home.appendingPathComponent("policy.json") }
+    public static var syncDir: URL { home.appendingPathComponent("sync", isDirectory: true) }
     public static var secretKeyFile: URL { home.appendingPathComponent("secret-key.txt") }
 }

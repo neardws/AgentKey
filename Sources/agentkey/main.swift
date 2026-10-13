@@ -32,6 +32,15 @@ USAGE
   agentkey plan apply <id> [--actions a1,a3]                 human-only: Touch ID / Apple Watch approval
   agentkey audit verify
 
+SYNC (no cloud, no server: your devices + an always-on home node, e.g. a Mac mini running `agentkeyd --sync-node`)
+  agentkey device pair [--show] [--host H,..] [--ttl SEC]   on the home node: print a one-time pairing code (QR text)
+  agentkey device pair <agentkey-pair:...>                  on the new device: join (pins the node fingerprint)
+  agentkey device list                                      paired devices, fingerprints, last sync
+  agentkey device revoke <device-id|name|fingerprint>       human-only; rotates the vault key
+  agentkey sync now | status                                sync with the home node now / show state
+  agentkey backup export <file>                             encrypted offline backup (passphrase; $AGENTKEY_BACKUP_PASSPHRASE)
+  agentkey backup restore <file>                            human-only; merges items into the vault
+
 Agent label: --agent L, else $AGENTKEY_AGENT, else "cli:<parent>".
 Output: --json (or AGENTKEY_OUTPUT=json) for JSON on every command; metadata commands
   (status/list/add/init/unlock/lock/audit) default to JSON when stdout is not a TTY. --text forces text.
@@ -431,6 +440,108 @@ case "plan":
         showPlan(r["plan"] ?? "{}")
         if !Out.json { print("changed \(r["changed"] ?? "0") item(s), purged \(r["purged"] ?? "0") — undo with a `restore` plan; previous values are in item history") }
     default: die("unknown plan subcommand \(sub)")
+    }
+
+case "device", "sync":
+    let sub = argv.first ?? (cmd == "sync" ? "status" : "list")
+    if !argv.isEmpty { argv.removeFirst() }
+    func statusObj(_ r: [String: String]) -> [String: Any] {
+        (try? JSONSerialization.jsonObject(with: Data((r["status"] ?? "{}").utf8))) as? [String: Any] ?? [:]
+    }
+    func printDevices(_ st: [String: Any]) {
+        print("this device: \(st["name"] ?? "?")  fp \(st["fingerprint"] ?? "?")\(st["isHomeNode"] as? Bool == true ? "  [home node]" : "")")
+        guard st["initialized"] as? Bool == true else { print("not paired — run `agentkey device pair` on the home node, then `agentkey device pair <code>` here"); return }
+        print("items in sync replica: \(st["items"] ?? 0), key version \(st["keyVersion"] ?? 0)")
+        for d in st["devices"] as? [[String: Any]] ?? [] {
+            var tags: [String] = []
+            if d["isSelf"] as? Bool == true { tags.append("this") }
+            if d["isHomeNode"] as? Bool == true { tags.append("home") }
+            if d["revoked"] as? Bool == true { tags.append("REVOKED") }
+            let last = (d["lastSync"] as? String) ?? "-"
+            let id8 = String((d["deviceID"] as? String ?? "").prefix(8))
+            let nm = (d["name"] as? String ?? "").padding(toLength: 18, withPad: " ", startingAt: 0)
+            let fp = d["fingerprint"] as? String ?? ""
+            let pend = d["pendingOut"] as? Int ?? 0
+            let tagStr = tags.isEmpty ? "" : "  [" + tags.joined(separator: ",") + "]"
+            print("  \(id8)  \(nm) \(fp)  last sync \(last)  pending \(pend)" + tagStr)
+        }
+    }
+    switch (cmd, sub) {
+    case ("device", "list"), ("sync", "status"):
+        let st = statusObj(rpc(client(), "sync.status", ["agent": agentLabel()]))
+        if Out.json { Out.emit(["sync": st]) } else { printDevices(st) }
+    case ("device", "pair"):
+        if let uri = argv.first(where: { $0.hasPrefix("agentkey-pair:") }) {
+            guard let p = try? PairingPayload(uri: uri) else { die("invalid pairing code") }
+            if !Out.json { err("joining \(p.nodeName) — verify this fingerprint matches the one shown on the home node:\n  \(p.fingerprint)") }
+            let r = rpc(client(), "device.pair.join", ["uri": uri, "agent": agentLabel()])
+            if Out.json {
+                let o: [String: String] = ["deviceID": r["deviceID"] ?? "", "fingerprint": r["fingerprint"] ?? "", "node": p.nodeName, "nodeFingerprint": p.fingerprint]
+                Out.emit(["paired": o])
+            }
+            else { print("✅ paired with \(p.nodeName). This device: \(r["fingerprint"] ?? "")\(r["vaultUnlocked"] == "true" ? "" : " (unlock the vault to merge items)")") }
+        } else {
+            _ = flag("--show")
+            var p = ["agent": agentLabel()]
+            if let h = opt("--host") { p["hosts"] = h }
+            if let t = opt("--ttl") { p["ttl"] = t }
+            let r = rpc(client(), "device.pair.offer", p)
+            if Out.json {
+                let hosts: [String] = (r["hosts"] ?? "").split(separator: ",").map(String.init)
+                var o: [String: Any] = ["uri": r["uri"] ?? "", "fingerprint": r["fingerprint"] ?? "", "expires": r["expires"] ?? ""]
+                o["hosts"] = hosts; o["port"] = Int(r["port"] ?? "") ?? 0
+                Out.emit(["pairing": o])
+            }
+            else {
+                print("One-time pairing code (expires \(r["expires"] ?? "?"); single use). Scan as QR or paste on the new device:\n")
+                print("  agentkey device pair \(r["uri"] ?? "")\n")
+                print("Home node fingerprint (confirm on the new device): \(r["fingerprint"] ?? "")")
+                print("Reachable at: \(r["hosts"] ?? "") port \(r["port"] ?? "")   (add Tailscale/WireGuard names with --host)")
+            }
+        }
+    case ("device", "revoke"):
+        guard let d = argv.first else { die("usage: agentkey device revoke <device-id|name|fingerprint>") }
+        let r = rpc(client(), "device.revoke", ["device": d, "agent": agentLabel()])
+        if Out.json { Out.emit(["revoked": ["device": r["device"] ?? "", "keyVersion": Int(r["keyVersion"] ?? "") ?? 0]]) }
+        else { print("✅ revoked \(r["device"] ?? d); vault key rotated. New records are unreadable to it; change any secret it may have seen.") }
+    case ("sync", "now"):
+        let r = rpc(client(), "sync.now", ["agent": agentLabel()])
+        let peers = (try? JSONSerialization.jsonObject(with: Data((r["peers"] ?? "[]").utf8))) as? [[String: String]] ?? []
+        if Out.json {
+            var o: [String: Any] = ["peers": peers, "vaultUnlocked": r["vaultUnlocked"] == "true"]
+            o["toReplica"] = Int(r["toReplica"] ?? "") ?? 0; o["toVault"] = Int(r["toVault"] ?? "") ?? 0
+            Out.emit(["sync": o])
+        }
+        else {
+            if peers.isEmpty { print("no peers with known addresses") }
+            for p in peers {
+                if p["ok"] == "true" { print("✅ \(p["name"] ?? ""): received \(p["received"] ?? "0"), sent \(p["sent"] ?? "0"), conflicts merged \(p["conflicts"] ?? "0")") }
+                else { print("❌ \(p["name"] ?? ""): \(p["error"] ?? "")") }
+            }
+            if r["vaultUnlocked"] != "true" { print("(vault locked: replica synced; items merge into the vault on next unlock)") }
+        }
+    default:
+        die("usage: agentkey device pair|list|revoke  /  agentkey sync now|status")
+    }
+
+case "backup":
+    guard argv.count >= 2, ["export", "restore"].contains(argv[0]) else { die("usage: agentkey backup export|restore <file>") }
+    let sub = argv[0], path = URL(fileURLWithPath: argv[1]).path
+    let pass = readSecret("Backup passphrase: ", env: "AGENTKEY_BACKUP_PASSPHRASE")
+    if sub == "export" {
+        if ProcessInfo.processInfo.environment["AGENTKEY_BACKUP_PASSPHRASE"] == nil, isatty(STDIN_FILENO) == 1 {
+            guard readSecret("Repeat passphrase: ") == pass else { die("passphrases do not match") }
+        }
+        let r = rpc(client(), "backup.export", ["path": path, "passphrase": pass, "agent": agentLabel()])
+        if Out.json { Out.emit(["backup": ["path": path, "items": Int(r["items"] ?? "") ?? 0]]) }
+        else { print("✅ wrote encrypted backup of \(r["items"] ?? "?") item(s) to \(path). Store the passphrase separately.") }
+    } else {
+        let r = rpc(client(), "backup.restore", ["path": path, "passphrase": pass, "agent": agentLabel()])
+        if Out.json {
+            let o: [String: Int] = ["added": Int(r["added"] ?? "") ?? 0, "updated": Int(r["updated"] ?? "") ?? 0, "inBackup": Int(r["inBackup"] ?? "") ?? 0]
+            Out.emit(["restore": o])
+        }
+        else { print("✅ restored: \(r["added"] ?? "0") added, \(r["updated"] ?? "0") updated (of \(r["inBackup"] ?? "0") in backup)") }
     }
 
 case "audit":
