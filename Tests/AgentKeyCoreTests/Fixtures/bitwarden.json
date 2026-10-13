@@ -1,0 +1,10 @@
+{"encrypted": false,
+ "folders": [{"id": "f1", "name": "Work"}],
+ "items": [
+  {"id": "a", "type": 1, "name": "Git Example", "notes": null, "folderId": "f1",
+   "fields": [{"name": "Recovery code", "value": "FAKE-RC-123", "type": 1}],
+   "login": {"uris": [{"uri": "https://git.example.com"}, {"uri": "https://git2.example.com"}], "username": "erin", "password": "Fake-BW-1", "totp": "JBSWY3DPEHPK3PXP"}},
+  {"id": "b", "type": 2, "name": "Wifi", "notes": "SSID test / pass Fake-BW-note", "secureNote": {"type": 0}},
+  {"id": "c", "type": 3, "name": "Fake Card", "card": {"number": "4111111111111111"}},
+  {"id": "d", "type": 1, "name": "Bad TOTP", "login": {"username": "erin", "password": "Fake-BW-2", "totp": "steam://ABCDE"}}
+ ]}

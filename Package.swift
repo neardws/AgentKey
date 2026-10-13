@@ -30,6 +30,7 @@ let package = Package(
         .executableTarget(name: "agentkey-mcp", dependencies: ["AgentKeyCore", "AgentKeyIPC"],
                           swiftSettings: [.swiftLanguageMode(.v5)]),
         .testTarget(name: "AgentKeyCoreTests", dependencies: ["AgentKeyCore", "AgentKeyIPC"],
+                    resources: [.copy("Fixtures")],
                     swiftSettings: [.swiftLanguageMode(.v5)]),
     ]
 )

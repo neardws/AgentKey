@@ -1,0 +1,4 @@
+folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp
+Work,1,login,VPN Example,,,0,https://vpn.example.com,frank,Fake-BWC-1,
+,,note,Door code,Fake note body,,0,,,,
+,,card,Card,,,0,,,,

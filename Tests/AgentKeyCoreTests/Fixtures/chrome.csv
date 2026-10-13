@@ -1,0 +1,4 @@
+name,url,username,password,note
+example.com,https://www.example.com/,carol,Fake-Chrome-1,
+app.example.io,https://app.example.io/signin,carol@example.io,Fake-Chrome-2,remember me
+example.com,https://example.com/,carol,Fake-Chrome-1,

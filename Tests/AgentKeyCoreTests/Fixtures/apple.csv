@@ -1,0 +1,3 @@
+Title,URL,Username,Password,Notes,OTPAuth
+shop.example.com (bob),https://shop.example.com/login,bob,Fake-Apple-1,,
+forum.example.net,https://forum.example.net,bob@example.net,Fake-Apple-2,"has ""quotes"", commas",otpauth://totp/forum:bob?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&digits=8
