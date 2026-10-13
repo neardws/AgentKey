@@ -139,4 +139,59 @@ final class CLITests: XCTestCase {
         XCTAssertEqual((audit["audit"] as? [String: Any])?["intact"] as? Bool, true)
         #endif
     }
+
+    func testImportHealthAndPlanFlow() throws {
+        let csv = try XCTUnwrap(Bundle.module.url(forResource: "chrome", withExtension: "csv", subdirectory: "Fixtures")
+                                ?? Bundle.module.url(forResource: "Fixtures/chrome.csv", withExtension: nil)).path
+        // dry run needs no vault and writes nothing
+        let dry = try run(["import", "auto", csv, "--dry-run", "--json"])
+        XCTAssertEqual(dry.code, 0, dry.out + dry.err)
+        let rep = try XCTUnwrap(try json(dry.out)["import"] as? [String: Any])
+        XCTAssertEqual(rep["format"] as? String, "chrome-csv")
+        XCTAssertEqual(rep["imported"] as? Int, 2)
+        XCTAssertEqual(rep["duplicatesInSource"] as? Int, 1)
+        XCTAssertFalse(dry.out.contains("Fake-Chrome"), "no secrets in import report")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent("vault.akv").path))
+
+        XCTAssertEqual(try run(["init", "--json"]).code, 0)
+        let imp = try json(try run(["import", "chrome-csv", csv, "--json"]).out)
+        XCTAssertEqual((imp["import"] as? [String: Any])?["imported"] as? Int, 2)
+        // re-import: everything is already in the vault
+        let again = try json(try run(["import", "auto", csv, "--json"]).out)
+        XCTAssertEqual((again["import"] as? [String: Any])?["duplicatesOfExisting"] as? Int, 2)
+        XCTAssertEqual(try run(["add", "login", "Reuse", "--username", "carol", "--password", "Fake-Chrome-2", "--url", "https://other.example.com"]).code, 0)
+
+        try startDaemon()
+        XCTAssertEqual(try run(["unlock"]).code, 0)
+        let h = try run(["health", "--json"])
+        XCTAssertEqual(h.code, 0, h.err)
+        XCTAssertFalse(h.out.contains("Fake-Chrome"), "health output must not contain secrets")
+        let findings = try XCTUnwrap((try json(h.out)["health"] as? [String: Any])?["findings"] as? [[String: Any]])
+        XCTAssertTrue(findings.contains { $0["kind"] as? String == "reused_password" })
+
+        let created = try json(try run(["plan", "create", "--json", "--agent", "claude-code"]).out)
+        let plan = try XCTUnwrap(created["plan"] as? [String: Any])
+        let pid = try XCTUnwrap(plan["id"] as? String)
+        XCTAssertEqual(plan["status"] as? String, "pending")
+        XCTAssertEqual(plan["createdBy"] as? String, "claude-code")
+
+        // invalid agent-supplied plan is rejected
+        let badFile = home.appendingPathComponent("bad.json")
+        try Data("[{\"id\":\"a1\",\"kind\":\"trash\",\"itemIDs\":[\"\(UUID().uuidString)\"],\"reason\":\"x\"}]".utf8).write(to: badFile)
+        XCTAssertEqual(try run(["plan", "create", "--from", badFile.path, "--json"]).code, 64)
+
+        #if os(macOS) || os(iOS)
+        throw XCTSkip("plan apply needs a real Touch ID / Apple Watch approval")
+        #else
+        let first = try XCTUnwrap((plan["actions"] as? [[String: Any]])?.first?["id"] as? String)
+        let ap = try run(["plan", "apply", pid, "--actions", first, "--json"])
+        XCTAssertEqual(ap.code, 0, ap.out + ap.err)
+        let applied = try XCTUnwrap(try json(ap.out)["plan"] as? [String: Any])
+        XCTAssertEqual(applied["status"] as? String, (plan["actions"] as? [Any])?.count == 1 ? "applied" : "partially_applied")
+        XCTAssertNotEqual(try run(["plan", "apply", pid, "--json"]).code, 0, "cannot apply twice")
+        let audit = try String(contentsOf: home.appendingPathComponent("audit.jsonl"), encoding: .utf8)
+        XCTAssertTrue(audit.contains("plan_action_applied") && audit.contains("plan_created"))
+        XCTAssertEqual(((try json(try run(["audit", "verify", "--json"]).out))["audit"] as? [String: Any])?["intact"] as? Bool, true)
+        #endif
+    }
 }

@@ -23,6 +23,10 @@ public enum ApprovalError: Error, Sendable, CustomStringConvertible {
     }
 }
 
+extension ApprovalError {
+    var isDenied: Bool { if case .denied = self { return true }; if case .timeout = self { return true }; return false }
+}
+
 public struct ApproverStatus: Sendable {
     public let touchIDReady: Bool
     public let watchReady: Bool
@@ -35,9 +39,12 @@ public struct ApprovalRequest: Sendable {
     public var mode: ReleaseMode
     public var code: String
     public var command: String?
+    /// Non-secret actions (e.g. applying a cleanup plan) supply their own prompt text.
+    public var customReason: String? = nil
     /// Text shown in the system sheet: "<App> is trying to <reason>".
     public var reason: String {
         let a = PromptSanitizer.clean(agent, max: 32), s = PromptSanitizer.clean(secretName, max: 40)
+        if let c = customReason { return PromptSanitizer.clean(c, max: 120) + " [\(code)]" }
         switch mode {
         case .reveal: return "release PLAINTEXT of “\(s)” to agent “\(a)” [\(code)]"
         case .totp: return "give a one-time code for “\(s)” to agent “\(a)” [\(code)]"

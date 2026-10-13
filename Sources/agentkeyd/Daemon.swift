@@ -105,11 +105,82 @@ final class Daemon: @unchecked Sendable {
                     }
                 }
                 log("approved", agent: agent, ref: refStr, mode: mode.rawValue, code: code, peer: peer)
+                _ = try? withVault { try $0.touch(id: item.id) }
                 if mode == .totp {
                     guard let t = TOTP(string: field.value) else { throw RPCError(.internalError, "field is not a TOTP secret") }
                     return RPCMessage(id: req.id, result: ["code": t.code(), "expiresIn": String(t.secondsRemaining()), "correlation": code])
                 }
                 return RPCMessage(id: req.id, result: ["value": Data(field.value.utf8).base64EncodedString(), "ref": refStr, "correlation": code])
+
+            case "health":
+                var opts = HealthOptions()
+                if let d = req.params["staleDays"].flatMap(Int.init) { opts.staleDays = d }
+                if let d = req.params["rotationDays"].flatMap(Int.init) { opts.rotationDays = d }
+                let report = try withVault { v in VaultHealth.analyze(try v.items(), hmacKey: v.healthKey, options: opts) }
+                log("health", agent: agent, detail: "\(report.findings.count) findings", peer: peer)
+                return RPCMessage(id: req.id, result: ["report": String(decoding: try Vault.encoder.encode(report), as: UTF8.self)])
+
+            case "plan.create":
+                // Agents may PROPOSE. Either supply actions JSON, or "auto" to derive from health.
+                let (plan, vid): (CleanupPlan, UUID) = try withVault { v in
+                    let items = try v.items()
+                    var p: CleanupPlan
+                    if let a = req.params["actions"] {
+                        let acts = try Vault.decoder.decode([PlanAction].self, from: Data(a.utf8))
+                        p = CleanupPlan(createdBy: agent, title: PromptSanitizer.clean(req.params["title"] ?? "Cleanup plan", max: 80), actions: acts)
+                    } else {
+                        p = CleanupPlanner.suggest(from: VaultHealth.analyze(items, hmacKey: v.healthKey), items: items, createdBy: agent)
+                    }
+                    for i in p.actions.indices { p.actions[i].state = .pending; p.actions[i].result = nil }
+                    do { try CleanupPlanner.validate(p, items: items) } catch { throw RPCError(.usage, "\(error)") }
+                    return (p, v.file.vaultID)
+                }
+                var p = plan; p.vaultID = vid
+                try PlanStore.save(p)
+                log("plan_created", agent: agent, ref: p.id, detail: "\(p.actions.count) actions", peer: peer)
+                return RPCMessage(id: req.id, result: ["plan": String(decoding: try Vault.encoder.encode(p), as: UTF8.self)])
+
+            case "plan.show":
+                if let id = req.params["id"] {
+                    guard let p = try? PlanStore.load(id) else { throw RPCError(.notFound, "no plan \(id)") }
+                    return RPCMessage(id: req.id, result: ["plan": String(decoding: try Vault.encoder.encode(p), as: UTF8.self)])
+                }
+                return RPCMessage(id: req.id, result: ["plans": String(decoding: try Vault.encoder.encode(PlanStore.list()), as: UTF8.self)])
+
+            case "plan.apply":
+                // Applying is a human decision: always gated by Touch ID / Apple Watch.
+                guard let id = req.params["id"], var plan = try? PlanStore.load(id) else { throw RPCError(.notFound, "no plan") }
+                guard plan.status == .pending else { throw RPCError(.usage, "plan is \(plan.status.rawValue)") }
+                let approved = req.params["actions"].map { Set($0.split(separator: ",").map(String.init)) }
+                if let a = approved, let bad = a.first(where: { x in !plan.actions.contains { $0.id == x } }) {
+                    throw RPCError(.usage, "unknown action \(bad)")
+                }
+                let n = approved?.count ?? plan.actions.count
+                let code = PromptSanitizer.correlationCode()
+                log("plan_apply_request", agent: agent, ref: id, code: code, detail: "\(n) actions", peer: peer)
+                try? conn.send(RPCMessage(id: nil, method: "progress", params: ["state": "awaiting_approval", "code": code, "ref": id,
+                    "hint": "Approve applying \(n) cleanup action(s) with Touch ID or Apple Watch"]))
+                var areq = ApprovalRequest(agent: agent, secretName: id, mode: .fill, code: code, command: nil)
+                areq.customReason = "apply \(n) vault cleanup action(s) from plan \(id) proposed by \(plan.createdBy)"
+                do { try await coordinator.approve(areq, timeout: 60) }
+                catch let e as ApprovalError {
+                    log("plan_apply_denied", agent: agent, ref: id, code: code, detail: e.description, peer: peer)
+                    throw RPCError(e.isDenied ? .userDenied : .noApprover, e.description)
+                }
+                let res = try withVault { v -> (CleanupPlan, Int, Int) in
+                    let r = try CleanupPlanner.apply(plan, approved: approved, items: try v.items())
+                    for item in r.changed { try v.upsert(item) }
+                    for pid in r.purge { try v.delete(id: pid) }
+                    return (r.plan, r.changed.count, r.purge.count)
+                }
+                plan = res.0
+                try PlanStore.save(plan)
+                for a in plan.actions {
+                    log("plan_action_\(a.state.rawValue)", agent: agent, ref: id, mode: a.kind.rawValue, code: code,
+                        detail: "\(a.id) items=\(a.itemIDs.map { String($0.uuidString.prefix(8)) }.joined(separator: ","))", peer: peer)
+                }
+                return RPCMessage(id: req.id, result: ["plan": String(decoding: try Vault.encoder.encode(plan), as: UTF8.self),
+                                                       "changed": String(res.1), "purged": String(res.2)])
 
             case "audit.verify":
                 let k = lock.withLock { vault?.auditKey }

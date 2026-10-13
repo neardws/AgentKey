@@ -41,6 +41,19 @@ let tools: [[String: Any]] = [
     ["name": "get_totp",
      "description": "Get the current one-time code for a TOTP item (approval-gated). Never returns the seed.",
      "inputSchema": ["type": "object", "required": ["ref"], "properties": ["ref": ["type": "string"]]]],
+    ["name": "vault_health",
+     "description": "Analyze vault hygiene (reused/weak/duplicate/stale/not-rotated/missing-TOTP/trash). Returns findings with item refs and metrics only — never secret values.",
+     "inputSchema": ["type": "object", "properties": ["stale_days": ["type": "integer"], "rotation_days": ["type": "integer"]]]],
+    ["name": "propose_cleanup",
+     "description": "Create a cleanup PLAN for the user to review. Nothing changes until the user approves it on their Mac with Touch ID / Apple Watch (`agentkey plan apply`). Omit actions to derive a plan from vault_health. Action kinds: merge (needs keep), trash, archive, restore, flag_rotation, add_tags, remove_tags (need tags), purge (trashed items only). Use item ids from list_items / vault_health.",
+     "inputSchema": ["type": "object", "properties": [
+        "title": ["type": "string"],
+        "actions": ["type": "array", "items": ["type": "object", "required": ["id", "kind", "itemIDs", "reason"], "properties": [
+            "id": ["type": "string"], "kind": ["type": "string"], "itemIDs": ["type": "array", "items": ["type": "string"]],
+            "keep": ["type": "string"], "tags": ["type": "array", "items": ["type": "string"]], "reason": ["type": "string"]]]]]]],
+    ["name": "get_plan_status",
+     "description": "Get a cleanup plan's status and per-action state (pending/applied/rejected). Omit plan_id to list plans. Agents cannot apply plans.",
+     "inputSchema": ["type": "object", "properties": ["plan_id": ["type": "string"]]]],
     ["name": "get_secret",
      "description": "Return a secret's PLAINTEXT. Disabled by default; only works if the user enabled `reveal` for this agent and item. Approval-gated. Prefer run_with_secret.",
      "inputSchema": ["type": "object", "required": ["ref"], "properties": ["ref": ["type": "string", "description": "ak://item[/field]"]]]],
@@ -61,10 +74,42 @@ func callTool(_ name: String, _ a: [String: Any]) -> [String: Any] {
             if let q = (a["query"] as? String)?.lowercased(), !q.isEmpty {
                 items = items.filter { $0.title.lowercased().contains(q) || $0.tags.contains { $0.lowercased().contains(q) } }
             }
-            let rows = items.map { ["ref": $0.ref, "title": $0.title, "kind": $0.kind.rawValue,
+            let rows = items.map { ["id": $0.id.uuidString, "ref": $0.ref, "title": $0.title, "kind": $0.kind.rawValue,
                                     "fields": $0.fields.map(\.id), "modes": $0.agentModes.map(\.rawValue)] as [String: Any] }
             let text = items.isEmpty ? "No items." : items.map { "\($0.ref) (\($0.kind.rawValue)) fields=\($0.fields.map(\.id).joined(separator: ",")) modes=\($0.agentModes.map(\.rawValue).joined(separator: ","))" }.joined(separator: "\n")
             return toolResult(text, structured: ["items": rows])
+
+        case "vault_health":
+            var p = ["agent": agent]
+            if let d = a["stale_days"] as? Int { p["staleDays"] = String(d) }
+            if let d = a["rotation_days"] as? Int { p["rotationDays"] = String(d) }
+            let r = try withClient { try $0.call("health", p) }
+            let obj = (try? JSONSerialization.jsonObject(with: Data((r["report"] ?? "{}").utf8))) as? [String: Any] ?? [:]
+            let rep = try? Vault.decoder.decode(HealthReport.self, from: Data((r["report"] ?? "{}").utf8))
+            let text = rep.map { r in "score \(r.score)/100, \(r.findings.count) findings\n" + r.findings.map { "[\($0.severity.rawValue)] \($0.kind.rawValue): \($0.refs.joined(separator: ", ")) — \($0.detail) ids=\($0.itemIDs.map(\.uuidString).joined(separator: ","))" }.joined(separator: "\n") } ?? ""
+            return toolResult(text, structured: obj)
+
+        case "propose_cleanup":
+            var p = ["agent": agent]
+            if let t = a["title"] as? String { p["title"] = t }
+            if let acts = a["actions"] {
+                p["actions"] = String(decoding: try JSONSerialization.data(withJSONObject: acts), as: UTF8.self)
+            }
+            let r = try withClient { try $0.call("plan.create", p) }
+            let obj = (try? JSONSerialization.jsonObject(with: Data((r["plan"] ?? "{}").utf8))) as? [String: Any] ?? [:]
+            let id = obj["id"] as? String ?? "?"
+            return toolResult("Created plan \(id) with \((obj["actions"] as? [Any])?.count ?? 0) action(s). Ask the user to review and approve it on their Mac: `agentkey plan show \(id)` then `agentkey plan apply \(id)` (Touch ID / Apple Watch). You cannot apply it.", structured: obj)
+
+        case "get_plan_status":
+            if let id = a["plan_id"] as? String {
+                let r = try withClient { try $0.call("plan.show", ["id": id, "agent": agent]) }
+                let obj = (try? JSONSerialization.jsonObject(with: Data((r["plan"] ?? "{}").utf8))) as? [String: Any] ?? [:]
+                let acts = (obj["actions"] as? [[String: Any]] ?? []).map { "\($0["id"] ?? "") \($0["kind"] ?? "") → \($0["state"] ?? "")" }
+                return toolResult("\(id): \(obj["status"] ?? "?")\n" + acts.joined(separator: "\n"), structured: obj)
+            }
+            let r = try withClient { try $0.call("plan.show", ["agent": agent]) }
+            let arr = (try? JSONSerialization.jsonObject(with: Data((r["plans"] ?? "[]").utf8))) as? [[String: Any]] ?? []
+            return toolResult(arr.map { "\($0["id"] ?? "") [\($0["status"] ?? "")] \($0["title"] ?? "")" }.joined(separator: "\n"), structured: ["plans": arr])
 
         case "get_totp":
             guard let ref = a["ref"] as? String else { return toolResult("ref required", isError: true) }

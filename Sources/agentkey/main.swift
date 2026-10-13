@@ -24,6 +24,12 @@ USAGE
   agentkey totp ak://<item>                      current code via daemon (approval-gated)
   agentkey exec --env NAME=ak://item[/field] [--env ...] -- <cmd> [args...]
   agentkey generate [--length 24] [--no-symbols] [--words N]
+  agentkey import <auto|1pux|1password-csv|apple-csv|chrome-csv|firefox-csv|bitwarden-json|bitwarden-csv|csv> <file>
+               [--dry-run] [--map title=Col,url=Col,username=Col,password=Col,notes=Col,totp=Col,tags=Col] [--modes ...]
+  agentkey health [--stale-days N] [--rotation-days N]      findings only, never secret values
+  agentkey plan create [--from actions.json] [--title T]     propose a cleanup plan (default: derived from health)
+  agentkey plan show [<id>]
+  agentkey plan apply <id> [--actions a1,a3]                 human-only: Touch ID / Apple Watch approval
   agentkey audit verify
 
 Agent label: --agent L, else $AGENTKEY_AGENT, else "cli:<parent>".
@@ -44,7 +50,7 @@ argv.removeFirst()
 
 // Commands whose stdout is the secret/value itself stay raw when piped unless --json is given,
 // so `X=$(agentkey get ...)` keeps working. Everything else defaults to JSON when piped.
-let rawValueCommands: Set<String> = ["get", "totp", "generate", "exec", "run", "help", "-h", "--help"]
+let rawValueCommands: Set<String> = ["get", "totp", "generate", "exec", "run", "help", "-h", "--help"]  // import/health/plan auto-JSON when piped
 do {
     // only look at flags before a `--` (exec passes the rest to the child)
     let head = argv.firstIndex(of: "--").map { Array(argv[..<$0]) } ?? argv
@@ -339,6 +345,93 @@ case "exec", "run":
                            "released": released, "warnings": red.warning.map { [$0] } ?? []]])
     }
     exit(p.terminationStatus)
+
+case "import":
+    // agentkey import <format|auto> <file> [--dry-run] [--map title=Col,password=Col,...] [--modes run,totp]
+    let dry = flag("--dry-run")
+    let mapSpec = opt("--map")
+    let modesArg = opt("--modes")
+    guard argv.count == 2 else { die("usage: agentkey import <auto|\(ImportFormat.allCases.map(\.rawValue).joined(separator: "|"))> <file> [--dry-run] [--map k=Column,...]") }
+    let fmtArg = argv[0], path = argv[1]
+    guard let data = FileManager.default.contents(atPath: path) else { die("cannot read \(path)", .notFound) }
+    let fmt: ImportFormat
+    do {
+        fmt = fmtArg == "auto" ? try Importer.detect(data: data, filename: path) : try ImportFormat(rawValue: fmtArg) ?? { throw ImportError.unrecognized("unknown format \(fmtArg)") }()
+    } catch { die("\(error)") }
+    var result: ImportResult
+    do { result = try Importer.parse(data: data, format: fmt, columnMap: try mapSpec.map(CSVColumnMap.init(spec:)) ?? CSVColumnMap()) }
+    catch { die("\(error)") }
+    if let m = modesArg { let modes = parseModes(m, default: []); for i in result.items.indices { result.items[i].agentModes = modes } }
+    result.report.dryRun = dry
+    if !dry {
+        let v = openVaultLocally()
+        do {
+            Importer.dropExisting(&result, existing: try v.items())
+            for item in result.items { try v.upsert(item) }
+        } catch { die("\(error)", .internalError) }
+        result.report.warnings.append("the export file \(path) still contains plaintext — securely delete it")
+    }
+    let r = result.report
+    if Out.json {
+        let rep = (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(r))) ?? [:]
+        Out.emit(["import": rep, "items": result.items.map { ["ref": ItemRef.make(title: $0.title), "kind": $0.kind.rawValue,
+                                                              "hasTOTP": $0.fields.contains { $0.id == "totp" }] as [String: Any] }])
+    } else {
+        print("\(dry ? "[dry run] would import" : "imported") \(r.imported) of \(r.totalInSource) (\(r.format.rawValue)); " +
+              "\(r.withTOTP) with TOTP; duplicates: \(r.duplicatesInSource) in file, \(r.duplicatesOfExisting) already in vault")
+        for k in r.byKind.keys.sorted() where r.byKind[k]! > 0 { print("  \(k): \(r.byKind[k]!)") }
+        for sk in r.skipped { print("  skipped #\(sk.index) \(sk.title ?? "(untitled)"): \(sk.reason)") }
+        for w in r.warnings { err("warning: \(w)") }
+        if !dry { print("Imported items have no agent access by default; enable per item with `--modes` or in the app.") }
+    }
+
+case "health":
+    var p = ["agent": agentLabel()]
+    if let d = opt("--stale-days") { p["staleDays"] = d }
+    if let d = opt("--rotation-days") { p["rotationDays"] = d }
+    let r = rpc(client(), "health", p)
+    let s = r["report"] ?? "{}"
+    if Out.json { Out.emit(["health": (try? JSONSerialization.jsonObject(with: Data(s.utf8))) ?? [:]]); break }
+    guard let rep = try? Vault.decoder.decode(HealthReport.self, from: Data(s.utf8)) else { die("bad report", .internalError) }
+    print("Vault health: \(rep.score)/100 — \(rep.itemCount) items, \(rep.findings.count) findings")
+    for f in rep.findings { print("  [\(f.severity.rawValue)] \(f.kind.rawValue): \(f.refs.joined(separator: ", ")) — \(f.detail)") }
+
+case "plan":
+    guard let sub = argv.first else { die("usage: agentkey plan create [--from actions.json] | show [id] | apply <id> [--actions a1,a3]") }
+    argv.removeFirst()
+    func showPlan(_ s: String) {
+        if Out.json { Out.emit(["plan": (try? JSONSerialization.jsonObject(with: Data(s.utf8))) ?? [:]]); return }
+        guard let p = try? Vault.decoder.decode(CleanupPlan.self, from: Data(s.utf8)) else { print(s); return }
+        print("\(p.id)  [\(p.status.rawValue)]  \(p.title)  by \(p.createdBy)")
+        for a in p.actions {
+            print("  \(a.id) \(a.state.rawValue.padding(toLength: 8, withPad: " ", startingAt: 0)) \(a.kind.rawValue) \(a.itemIDs.count) item(s)\(a.tags.map { " tags=" + $0.joined(separator: ",") } ?? "") — \(a.reason)")
+        }
+    }
+    switch sub {
+    case "create":
+        var p = ["agent": agentLabel()]
+        if let f = opt("--from") {
+            guard let d = FileManager.default.contents(atPath: f) else { die("cannot read \(f)", .notFound) }
+            p["actions"] = String(decoding: d, as: UTF8.self)
+        }
+        if let t = opt("--title") { p["title"] = t }
+        showPlan(rpc(client(), "plan.create", p)["plan"] ?? "{}")
+    case "show":
+        if let id = argv.first { showPlan(rpc(client(), "plan.show", ["id": id, "agent": agentLabel()])["plan"] ?? "{}"); break }
+        let s = rpc(client(), "plan.show", ["agent": agentLabel()])["plans"] ?? "[]"
+        if Out.json { Out.emit(["plans": (try? JSONSerialization.jsonObject(with: Data(s.utf8))) ?? []]); break }
+        for p in (try? Vault.decoder.decode([CleanupPlan].self, from: Data(s.utf8))) ?? [] {
+            print("\(p.id)  [\(p.status.rawValue)]  \(p.actions.count) actions  by \(p.createdBy)  \(p.title)")
+        }
+    case "apply":
+        guard let id = argv.first else { die("plan apply needs a plan id") }
+        var p = ["id": id, "agent": agentLabel()]
+        if let a = opt("--actions") { p["actions"] = a }
+        let r = rpc(client(), "plan.apply", p)
+        showPlan(r["plan"] ?? "{}")
+        if !Out.json { print("changed \(r["changed"] ?? "0") item(s), purged \(r["purged"] ?? "0") — undo with a `restore` plan; previous values are in item history") }
+    default: die("unknown plan subcommand \(sub)")
+    }
 
 case "audit":
     let r = rpc(client(), "audit.verify", ["agent": agentLabel()])

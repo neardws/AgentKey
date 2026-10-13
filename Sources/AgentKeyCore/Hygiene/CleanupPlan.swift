@@ -44,6 +44,20 @@ public struct PlanAction: Codable, Equatable, Sendable {
     public var state: State = .pending
     public var result: String?
 
+    enum CodingKeys: String, CodingKey { case id, kind, itemIDs, keep, tags, reason, state, result }
+    /// Lenient decoding for agent-supplied actions (state/result optional).
+    public init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        kind = try c.decode(Kind.self, forKey: .kind)
+        itemIDs = try c.decode([UUID].self, forKey: .itemIDs)
+        keep = try c.decodeIfPresent(UUID.self, forKey: .keep)
+        tags = try c.decodeIfPresent([String].self, forKey: .tags)
+        reason = try c.decodeIfPresent(String.self, forKey: .reason) ?? ""
+        state = try c.decodeIfPresent(State.self, forKey: .state) ?? .pending
+        result = try c.decodeIfPresent(String.self, forKey: .result)
+    }
+
     public init(id: String, kind: Kind, itemIDs: [UUID], keep: UUID? = nil, tags: [String]? = nil, reason: String) {
         self.id = id; self.kind = kind; self.itemIDs = itemIDs; self.keep = keep; self.tags = tags; self.reason = reason
     }
