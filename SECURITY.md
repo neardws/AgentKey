@@ -31,3 +31,16 @@ Does **not** protect against (known limitations):
 - Not in a GUI (Aqua) session → deny. Timeout (default 60 s) → deny.
 - Peer uid ≠ daemon uid → connection dropped.
 - Non-Apple platforms always deny (DEBUG builds only may use `AGENTKEY_INSECURE_TEST_APPROVE` for tests).
+
+## Import, hygiene and sync (v0.2)
+
+- Imports read the export file into memory only (ZIP inflated in memory); AgentKey never writes plaintext to disk,
+  but the export file you created still contains plaintext — delete it securely afterwards.
+- Imported items get no agent release modes until you enable them.
+- Vault health runs inside agentkeyd; agents receive findings (ids, refs, metrics) only. Reused-password groups use an
+  HMAC keyed by a vault-derived key, so group ids cannot be compared across vaults or brute-forced offline.
+- Cleanup plans are proposals; applying requires Touch ID / Apple Watch, can be partial, is audited per action, and
+  (except `purge` of already-trashed items) is reversible. There is no MCP tool to apply plans. Note: any local process
+  running as you can invoke `agentkey plan apply`, but it still cannot get past the biometric prompt.
+- Sync uploads only AES-GCM ciphertext plus non-secret metadata (record id, Lamport clock, device id, deleted flag,
+  key version) to your iCloud private database. The CloudKit adapter is not yet validated on a device.

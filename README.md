@@ -1,14 +1,19 @@
 # AgentKey
 
-**Agent-Native password & secrets manager for Apple devices.**
-面向 Apple 设备的 Agent 原生密码与密钥管理器。
+**A personal password manager for humans and AI agents on Apple devices.**
+AutoFill everywhere on Mac, iPhone and iPad · end-to-end encrypted sync through your own iCloud · AI agents that use
+*and tidy* your vault — only with your Touch ID or Apple Watch approval.
 
-AgentKey is a personal, open-source, 1Password-style vault for Mac, iPhone and iPad, designed from day one so that
-AI agents (Claude Code, Cursor, Codex, MCP clients, scripts…) can *use* your secrets — while **you approve every
-single release with Touch ID or a double-click on your Apple Watch**, and agents ideally never see the plaintext.
+面向人和 AI Agent 的个人密码管理器：Apple 全端自动填充，自己的 iCloud 端到端加密同步，Agent 在你的 Touch ID / Apple Watch 批准下取用并帮你打理保险库。
 
-> Status: **v0.1 / Phase 1 (Mac-first)** — core crypto, vault, CLI, daemon and MCP server. Not audited. Don't put
-> your only copy of important secrets in it yet.
+- **For you**: AutoFill credential provider (passwords, passkeys, TOTP) on iOS/iPadOS/macOS, Safari extension,
+  menu-bar quick search, import from 1Password / Apple Passwords / Chrome / Firefox / Bitwarden / CSV. *(apps: roadmap)*
+- **For agents**: `agentkeyd` + `agentkey` CLI + MCP server. Agents get secrets injected into processes (never shown by
+  default), read vault health findings (metadata only), and propose cleanup plans that **you** approve.
+- **Personal & serverless**: every device holds the full encrypted vault; sync is ciphertext-only via CloudKit private DB.
+
+> Status: **v0.2 (Phase 1.5)** — core crypto & vault, Mac daemon/CLI/MCP, importers, vault health + cleanup plans,
+> sync model with 3-way merge (CloudKit adapter is a skeleton pending Mac validation). Not audited.
 
 [中文说明](#中文说明) · [Design doc (zh)](docs/DESIGN.zh.md) · [Security](SECURITY.md)
 
@@ -41,7 +46,7 @@ single release with Touch ID or a double-click on your Apple Watch**, and agents
 
 | Target | What |
 |---|---|
-| `AgentKeyCore` (macOS 14+/iOS 17+, also Linux) | CryptoKit AES-GCM + HKDF, 2SKD key hierarchy, `PasswordKDF` (PBKDF2-SHA256 600k today, Argon2id TODO), Secret Key, vault model (login / secure note / API token / TOTP), encrypted store, RFC 6238 TOTP, password generator, policy, prompt sanitizer, redactor, audit log |
+| `AgentKeyCore` (macOS 14+/iOS 17+, also Linux) | **Importers** (1PUX, 1Password/Apple/Chrome/Firefox/Bitwarden/generic CSV, Bitwarden JSON, otpauth), **Hygiene** (`VaultHealth`, `CleanupPlan`), **Sync** (Lamport `Stamp`, `RecordMeta`, tombstones, `MergeEngine` 3-way merge, `CloudKitSyncAdapter` skeleton), CryptoKit AES-GCM + HKDF, 2SKD key hierarchy, `PasswordKDF` (PBKDF2-SHA256 600k today, Argon2id TODO), Secret Key, vault model (login / secure note / API token / TOTP), encrypted store, RFC 6238 TOTP, password generator, policy, prompt sanitizer, redactor, audit log |
 | `AgentKeyIPC` | Unix-socket framing, peer credentials, daemon client |
 | `agentkeyd` | per-user daemon; Touch ID / Apple Watch approval (`ApprovalGate.swift`) |
 | `agentkey` | CLI (`ak` alias via installer) |
@@ -82,7 +87,21 @@ agentkey exec --agent claude-code --env OPENAI_API_KEY=ak://OpenAI -- python my_
 agentkey totp ak://AWS
 agentkey generate --length 32
 agentkey audit verify
+
+# migrate (export file is read into memory only; delete it afterwards)
+agentkey import auto ~/Downloads/1PasswordExport.1pux --dry-run
+agentkey import apple-csv ~/Downloads/Passwords.csv
+agentkey import csv export.csv --map title=Account,password=Secret
+
+# let an agent tidy up — it can only propose; you approve
+agentkey health --json
+agentkey plan create                 # or MCP propose_cleanup
+agentkey plan show plan-1a2b3c4d
+agentkey plan apply plan-1a2b3c4d --actions a1,a3   # Touch ID / Apple Watch
 ```
+
+MCP tools: `list_items`, `run_with_secret`, `get_totp`, `get_secret` (off by default), `vault_health`,
+`propose_cleanup`, `get_plan_status`. There is deliberately no tool to apply a plan.
 
 **Agent-native output:** every command accepts `--json` (or `AGENTKEY_OUTPUT=json`); metadata commands
 (`status`, `list`, `add`, `init`, `unlock`, `lock`, `audit`) emit JSON automatically when stdout is not a TTY.
@@ -108,19 +127,24 @@ Set the client's tool timeout ≥ 90 s — approvals wait up to 60 s.
 
 ## Roadmap
 
-- **Phase 1 (this release)**: Mac daemon, CLI, MCP, Touch ID / Watch approvals, audit log.
-- **Phase 2**: Argon2id; Secure Enclave–wrapped VK (unlock without typing the master password), signed app +
-  keychain ACL `[.biometryCurrentSet, .or, .companion]`; `http` / `inject` modes; grants & revoke; menu-bar app.
-- **Phase 3**: iCloud (CloudKit private DB) sync with conflict resolution; iPhone / iPad apps.
-- **Phase 4**: AutoFill Credential Provider extension, Safari web extension, passkeys (as provider), `fill` mode.
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | Mac core + agent channel: crypto, vault, `agentkeyd` Touch ID/Watch approvals, CLI, MCP, audit, `--json`, redaction | ✅ v0.1 |
+| 1.5 | Importers, vault health + cleanup plans, sync model (Lamport, tombstones, 3-way merge), CKSyncEngine skeleton | ✅ v0.2 (sync adapter: Mac validation pending) |
+| 2 | Encrypted SQLite record store, CKSyncEngine live sync, Argon2id, Secure Enclave unlock, signed app + App Group | ⏳ |
+| 3 | iPhone / iPad / Mac apps, AutoFill extension (passwords + TOTP), menu-bar quick search, import wizard | ⏳ |
+| 4 | Passkeys provider, Safari web extension, Chrome extension | ⏳ |
+| 5 | Rotation assistant, `http`/`inject`/`fill` modes, grants & revoke, remote approval on iPhone, encrypted audit | ⏳ |
 
 ---
 
 ## 中文说明
 
-AgentKey 是一个个人使用、开源、类似 1Password 的密码管理器，覆盖 Mac / iPhone / iPad，并且**从设计上就把 AI Agent 当作一等调用方**：
+AgentKey 是一个个人使用、开源、类似 1Password 的密码管理器，覆盖 Mac / iPhone / iPad。**人和 AI Agent 都是一等用户**：
+你在所有 App 和网站里享受自动填充（密码、通行密钥、验证码），从 1Password / Apple 密码 / Chrome / Firefox / Bitwarden 一键迁移，
+通过自己的 iCloud 端到端加密同步；Agent 则可以取用秘密、体检保险库并提出清理计划——
 Agent 可以"使用"你的密码和 API Key，但每一次释放都必须由你本人在 Mac 上用 **Touch ID（妙控键盘）或双击 Apple Watch 侧边按钮** 确认；
-推荐的 `run` 模式下，秘密只注入子进程环境变量，Agent 自己看不到明文。
+推荐的 `run` 模式下，秘密只注入子进程环境变量，Agent 自己看不到明文；Agent 提出的清理计划（合并重复、归档、标记轮换等）也必须由你批准才会执行，且可撤销、全程审计。
 
 ### 安全模型（摘要）
 
@@ -144,8 +168,10 @@ agentkey init && agentkey unlock && agentkey status
 
 ### 路线图
 
-Phase 2：Argon2id、Secure Enclave 快速解锁、签名 App + 钥匙串访问控制、`http`/`inject` 模式、菜单栏 App ·
-Phase 3：iCloud（CloudKit）同步、iPhone / iPad App · Phase 4：自动填充扩展、Safari 扩展、通行密钥（Passkeys）。
+Phase 1 ✅ Mac 核心 + Agent 通道 · Phase 1.5 ✅ 迁移导入、保险库体检与清理计划、同步模型（三方合并）·
+Phase 2：加密 SQLite 记录库、CKSyncEngine 实际同步、Argon2id、Secure Enclave 快速解锁 ·
+Phase 3：iPhone / iPad / Mac App、自动填充扩展、菜单栏快速搜索 · Phase 4：通行密钥、Safari / Chrome 扩展 ·
+Phase 5：轮换助手、`http` 模式、iPhone 远程审批。
 
 详细设计见 [docs/DESIGN.zh.md](docs/DESIGN.zh.md)。
 

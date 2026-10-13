@@ -1,46 +1,176 @@
-# AgentKey 设计文档（Agent-Native 版）
+# AgentKey 设计文档
 
-> **Agent-Native password & secrets manager for Apple devices.**
-> 本文由早期方案（代号 NVault）改写而来，项目已更名为 **AgentKey**，并转向 *Agent-Native*：
-> 从第一天起就把 "AI Agent 是一等调用方" 作为核心场景，而不是给人用的密码管理器顺带开放 API。
+> **人和 Agent 都是一等用户的个人密码管理器：Mac / iPhone / iPad 全端自动填充，iCloud 端到端加密同步，AI Agent 在 Touch ID / Apple Watch 审批下取用并帮你打理保险库。**
+> *A personal password manager for humans and AI agents — AutoFill everywhere on Apple devices, end-to-end encrypted iCloud sync, and agents that use and tidy your vault under Touch ID / Apple Watch approval.*
 
-## 0. Agent-Native 版本要点（相对原方案的变化）
-
-| 主题 | 原方案（NVault） | AgentKey（当前） |
-|---|---|---|
-| 名称 / 进程 | NVaultAgent、`nvault` | `agentkeyd`（守护进程）、`agentkey` CLI、`agentkey-mcp` MCP Server |
-| 引用语法 | `nv://vault/item/field` | `ak://<条目标题或UUID>[/<字段>]`（v0.1 单保险库；多保险库见路线图） |
-| Socket | `~/Library/Group Containers/TEAMID.../agent.sock` | v0.1：`~/Library/Application Support/AgentKey/agent.sock`（目录 0700 / socket 0600）；签名 App 版本迁回 App Group |
-| Bundle ID | `com.neilxu.nvault.*` | `com.neardws.agentkey.*` |
-| 优先级 | 先做人用 App，再加 Agent | **先做 Agent 通路（Phase 1 = Mac + CLI + MCP）**，再做 iPhone/iPad App、AutoFill、同步 |
-| 默认释放模式 | — | `run`（环境变量注入）+ `totp`；`reveal`（明文）在 Agent 策略 **和** 条目上都要显式开启 |
-
-### 0.1 v0.1 代码与本文章节对应
-
-| 本文章节 | 代码 | 状态 |
-|---|---|---|
-| §4 密钥体系（2SKD：主密码 KDF ⊕ HKDF(Secret Key)） | `Sources/AgentKeyCore/KeyHierarchy.swift`, `KDF.swift`, `SecretKey.swift` | ✅ 已实现；KDF 暂用 PBKDF2-HMAC-SHA256 600k（`PasswordKDF` 抽象，Argon2id 为 TODO） |
-| §5 数据模型 / 加密封装 | `Models.swift`, `VaultStore.swift` | ✅ 单文件 JSON 信封；每条目 AES-256-GCM，AAD 绑定 vaultID/itemID/revision |
-| §10.2 TOTP | `TOTP.swift` | ✅ RFC 4226/6238 全部测试向量通过 |
-| §11 审批服务（ApprovalGate） | `Sources/agentkeyd/ApprovalGate.swift` | ✅ 代码完成（Touch ID 或 Apple Watch、每次新 LAContext、复用时长 0、无密码回退、60 s 超时、串行弹窗、4 位关联码、提示文本净化）；**需在 Mac 上实测** |
-| §11.8 策略引擎 | `Policy.swift`（`AgentPolicy`） | ✅ 基础版：按 Agent 的模式 + 条目 glob 白名单；策略只能收窄，永远需要人确认 |
-| §12.1 释放模式 | `run` / `totp` / `reveal` 已实现；`http` / `inject` / `fill` 为路线图 |
-| §12.2 CLI | `Sources/agentkey/main.swift` | ✅ init / unlock / lock / status / add / list / get / totp / exec / generate / audit verify |
-| §12.3 IPC | `Sources/AgentKeyIPC/*` | ✅ 4 字节长度 + JSON（JSON-RPC 2.0 语义）、`progress` 通知、对端 uid 校验 |
-| §12.4 MCP | `Sources/agentkey-mcp/main.swift` | ✅ stdio；工具 list_items / run_with_secret / get_totp / get_secret |
-| 审计 | `AuditLog.swift` | ✅ 追加式 JSONL，SHA-256 哈希链 + HMAC（密钥由 VK 派生）；原方案的 HPKE 加密审计为路线图 |
-| §7 iCloud 同步、§8 AutoFill、§9 Safari、§10.1 Passkeys、Secure Enclave 快速解锁 | — | ⏳ 路线图（见 README） |
-
-### 0.2 v0.1 的有意简化（务必知晓）
-
-1. **解锁方式**：`agentkey unlock` 把主密码经 0600 Unix socket 发给同一用户的 `agentkeyd`，守护进程在内存中持有 VK。尚未使用 Secure Enclave 包裹（§4 设备快速解锁）。
-2. **调用方身份不可信**：`agent` 标签由调用方自报，仅用于提示与审计；真正的安全边界是"每次释放都要你本人 Touch ID / Watch 确认" + 提示框里的关联码。
-3. **输出脱敏是尽力而为**：子进程可以对秘密做变形后再打印（例如截断、拼接），脱敏只覆盖原文 / Base64 / Hex / URL 编码。
-4. **非 Apple 平台**（Linux CI）：没有 LocalAuthentication，`agentkeyd` 一律拒绝；仅 DEBUG 构建可用 `AGENTKEY_INSECURE_TEST_APPROVE=1` 做集成测试。
+本文 Part A 为当前权威设计（2026-10 修订：双用户模型 + 同步 + 迁移 + Agent 维护）；Part B 为早期方案正文（代号 NVault），其中的密钥体系、审批服务、AutoFill、Safari、Passkeys 等细节仍然有效，与 Part A 冲突时以 Part A 和代码为准。
 
 ---
 
-> 以下为原方案正文（已做命名替换：NVault→AgentKey，`nvault`→`agentkey`，`nv://`→`ak://`，`com.neilxu.nvault`→`com.neardws.agentkey`）。
+# Part A：当前设计
+
+## A1. 定位
+
+| 用户 | 主要诉求 | 入口 |
+|---|---|---|
+| **人（Neil）** | 在任何 App / 网站里一键填充密码、通行密钥（Passkeys）和验证码；快速搜索复制；从 1Password / Apple 密码 / 浏览器无痛迁移 | iOS/iPadOS/macOS AutoFill 凭据提供扩展（含 Passkeys、TOTP）、Safari Web 扩展、（后续）Chrome 扩展、macOS 菜单栏快速搜索、iPhone/iPad/Mac App |
+| **AI Agent** | ① **使用**秘密（API Key、登录、验证码）且尽量不看到明文；② **打理**保险库（体检、去重、轮换提醒、整理标签） | `agentkeyd` + `agentkey` CLI + `agentkey-mcp`；所有取用与变更都需你在 Mac 上用 Touch ID 或 Apple Watch 批准 |
+
+原则：
+
+1. **个人、无服务器**：每个用户独立，数据只在自己的设备和自己的 iCloud 私有数据库里；项目不运营任何后端。
+2. **每台设备都有完整的加密保险库**，离线可用；同步只是交换密文。
+3. **端到端加密**：Apple / iCloud 只看到密文和非敏感同步元数据（记录 ID、Lamport 时钟、设备 ID、删除标记、密钥版本）。
+4. **人是最终决策者**：Agent 可以读取元数据、提出建议，但秘密的每次释放、保险库的每次变更都要人确认（生物识别），可部分批准、可撤销、全部审计。
+5. **Agent 默认看不到明文**：`run`（注入子进程）/`totp`/`http`（规划中）优先，`reveal` 默认关闭；导入的条目默认不对 Agent 开放。
+
+## A2. 架构
+
+```
+┌──────────────── iPhone / iPad ────────────────┐   ┌──────────────────── Mac ────────────────────────────┐
+│ AgentKey App (SwiftUI)                         │   │ AgentKey App + 菜单栏快速搜索                         │
+│ AutoFill Credential Provider 扩展               │   │ AutoFill 扩展 · Safari Web 扩展 ·（后续）Chrome 扩展     │
+│   密码 / Passkeys / TOTP                        │   │ agentkeyd (LaunchAgent, Aqua 会话)                    │
+│                                                │   │   ├─ ApprovalGate：Touch ID 或 Apple Watch            │
+│                                                │   │   ├─ 策略引擎、审计（哈希链 + HMAC）                    │
+│                                                │   │   └─ 健康分析 / 清理计划执行                            │
+│                                                │   │ agentkey CLI · agentkey-mcp  ←── AI Agent              │
+└───────────────┬────────────────────────────────┘   └───────────────┬────────────────────────────────────┘
+                │            AgentKeyCore（共享 Swift Package，跨平台，Linux 上可测）            │
+                │  密钥体系 · 条目模型 · 加密记录存储 · 3-way 合并 · 导入器 · 健康分析 · TOTP · 生成器  │
+                ▼                                                                      ▼
+        本地加密记录库（SQLite，每条记录 AES-256-GCM）  ⇄  CKSyncEngine  ⇄  iCloud 私有数据库（自定义 Zone，只存密文）
+```
+
+App、扩展、守护进程通过 App Group 共享同一个加密记录库；扩展只做读取（AutoFill 填充后通过共享队列回写 `lastUsedAt`）。
+
+## A3. 密钥体系（沿用 Part B §4，已实现部分）
+
+- AUK = KDF(主密码) ⊕ HKDF-SHA256(Secret Key, salt=accountID, info="agentkey/2skd/v1")。KDF 现为 PBKDF2-HMAC-SHA256 600k（`PasswordKDF` 抽象），Phase 2 换 Argon2id（m=128 MiB, t=3, p=4；扩展内不跑 Argon2，走 Secure Enclave 快速解锁）。
+- AUK 解封保险库密钥 VK；VK 派生子密钥：`audit`（审计 HMAC）、`health`（健康分析的密码分组 HMAC）、`record`（同步记录，带 keyVersion 以支持轮换）。
+- Secret Key：128 位，`A1-` + Crockford Base32 + 校验位，仅存本机钥匙串（ThisDeviceOnly，不进 iCloud 钥匙串）；新设备通过二维码 / 紧急备份卡加入。
+
+## A4. 本地存储：加密记录库（替代 v0.1 的单文件 JSON 信封）
+
+v0.1 使用一个 JSON 信封文件（`vault.akv`），便于原型；Phase 2 起改为 **SQLite 记录库**（App Group 容器内，`NSFileProtectionComplete` / Data Protection），设计为与 CKRecord 一一对应：
+
+```sql
+CREATE TABLE meta(key TEXT PRIMARY KEY, value BLOB);          -- accountID, kdf 参数, wrappedVK, deviceID, lamport, engineState
+CREATE TABLE records(
+  id          TEXT PRIMARY KEY,      -- UUID = CKRecord.recordName
+  revision    INTEGER NOT NULL,      -- 本地编辑计数
+  lamport     INTEGER NOT NULL,      -- Lamport 时钟
+  device      TEXT    NOT NULL,      -- 最后写入的设备
+  deleted     INTEGER NOT NULL DEFAULT 0,   -- 墓碑
+  key_version INTEGER NOT NULL,
+  ct          BLOB,                  -- AES-256-GCM(VK_record, item JSON, AAD="agentkey/record|<id>|k<kv>")；墓碑为 NULL
+  pending     INTEGER NOT NULL DEFAULT 0,   -- 待上传
+  ck_system   BLOB                   -- CKRecord system fields（change tag）
+);
+CREATE TABLE bases(                  -- 3-way 合并基线：最后一次与服务器一致的版本
+  id TEXT PRIMARY KEY, lamport INTEGER, device TEXT, deleted INTEGER, ct BLOB);
+CREATE TABLE search_index(           -- 加密的搜索索引（标题/域名 token 的 HMAC），供 AutoFill 快速匹配
+  token_mac BLOB, id TEXT);
+```
+
+- **每条记录单独加密**（AES-GCM，AAD 绑定记录 ID 和密钥版本），整库不需要 SQLCipher；元数据列只含非敏感信息。
+- 写入流程：`lamport += 1` → 生成新 `revision` → 加密 → `pending=1` → 通知同步引擎。
+- 删除 = 写墓碑（`deleted=1, ct=NULL`），墓碑保留 ≥ 90 天后再真正清除（保证离线设备能收到删除）；条目层面另有"废纸篓"（`trashedAt`，可恢复，默认 30 天后由健康分析建议清除）。
+- 历史：条目内部保存最近 20 次被替换的秘密值（加密在条目内），用于合并冲突、清理计划与轮换的撤销。
+- 代码现状：`SyncRecord` / `RecordMeta` / `Stamp` / `SyncReplica`（内存参考实现）已实现并测试；SQLite 实现是 Phase 2 工作，必须通过与 `SyncReplica` 相同的测试。
+
+## A5. 同步：CKSyncEngine + 字段级三方合并
+
+- **传输**：`CKSyncEngine`（iOS 17 / macOS 14+），私有数据库，自定义 Zone `AgentKeyVault`，记录类型 `VaultRecord`，字段 `ct, rev, lamport, device, deleted, kv`。容器 `iCloud.com.neardws.agentkey`。代码：`Sources/AgentKeyCore/Sync/CloudKitSyncAdapter.swift`（骨架，待 Mac 验证）。
+- **时钟**：每台设备一个 Lamport 时钟；收到远端记录时 `observe`。冲突裁决用 `(lamport, deviceID)` 全序。
+- **合并**（`MergeEngine`，已实现 + 测试）：
+  - 以 `bases` 为共同祖先，逐属性三方合并：只有一侧改 → 取该侧；两侧改成相同 → 取之；两侧改成不同 → 较大 Stamp 获胜，**落败的秘密值写入条目历史**，不丢数据，并记录冲突供 UI 提示。
+  - URL、标签、Agent 模式按集合三方合并（两侧的增删都保留）。
+  - 字段按 `field.id` 合并；删除 vs 编辑 → 保留编辑（复活）并提示；删除 vs 未改 → 删除。
+  - 无共同祖先（两台设备离线各自新建同 ID，极少）→ 整条 LWW，落败方进历史。
+- **冲突回路**：上传遇到 `serverRecordChanged` → 取服务器记录合并 → 若结果不同于服务器 → 重新排队上传。
+- **账号变化**：退出 / 切换 Apple ID → 停止同步、清除同步状态，不把保险库静默上传到另一个账号。
+- 测试：随机化 3 设备 × 30 轮编辑/删除/新增，在模拟 CloudKit 的乐观并发服务器上最终收敛。
+
+## A6. 迁移导入（`Importers`，已实现）
+
+| 来源 | 格式 | 说明 |
+|---|---|---|
+| 1Password | `.1pux`（ZIP 内 `export.data` JSON） | 登录、密码、安全笔记、API 凭据；TOTP（sections 中 `totp`）；自定义字段；标签、归档、非个人保险库名作为标签；跳过废纸篓；附件与通行密钥提示未导入 |
+| 1Password | CSV | Title, Url, Username, Password, OTPAuth, Favorite, Archived, Tags, Notes |
+| Apple 密码 / iCloud 钥匙串 | CSV | Title, URL, Username, Password, Notes, OTPAuth |
+| Chrome / Edge / Brave / Arc | CSV | name, url, username, password, note |
+| Firefox | CSV | url, username, password, …（跳过 `chrome://` 内部条目，标题取域名） |
+| Bitwarden | JSON（未加密）/ CSV | 登录、安全笔记、自定义字段、文件夹→标签、多 URI；卡片 / 身份 / SSH 暂不支持并报告 |
+| 通用 CSV | 自动识别常见列名，`--map title=…,password=…` 自定义 | 支持 `,` `;` Tab 分隔、BOM、多行字段 |
+
+- TOTP：`otpauth://` 解析并规范化（发行方、账户、算法、位数、周期）；裸 Base32 也接受；Steam 等非标准格式警告并跳过该字段。
+- 去重：登录按「规范化主机 + 用户名 + SHA-256(密码‖TOTP)」，其他按类型 + 标题 + 内容摘要；文件内重复和已在保险库中的都会跳过并报告。
+- `ImportReport`：来源总数、导入数（按类型）、含 TOTP 数、重复数、跳过列表（序号、标题、原因）、警告。
+- **明文绝不落盘**：导入文件只读入内存（ZIP 也在内存中解压，纯 Swift inflate + CRC 校验）；完成后提示用户安全删除导出文件。
+- 导入的条目 `agentModes = []`：Agent 默认无权取用，需人逐条开启。
+- CLI：`agentkey import <auto|格式> <文件> [--dry-run] [--map …] [--json]`；App 里将提供同等的导入向导。
+
+## A7. Agent 维护保险库（AI-Native Hygiene）
+
+**目标**：Agent 不只是取秘密，还能当"保险库管家"——但它**只能看到元数据、只能提建议**，执行必须由人批准。
+
+### A7.1 健康分析（`VaultHealth`，已实现）
+
+在可信进程（`agentkeyd` / App）内计算，Agent 只拿到发现项：
+
+| 发现 | 判定 | 隐私处理 |
+|---|---|---|
+| `reused_password` | 多个条目秘密相同 | 按 `HMAC(VK_health, 密码)` 分组，输出的 groupID 只是 HMAC 前缀，换保险库即不同，不能离线比对 |
+| `weak_password` | 常见密码表 / 长度 < 12 / 估算熵 < 60 bit | 只输出熵、长度 |
+| `duplicate_entry` | 同主机 + 同用户名 | — |
+| `stale_item` | `lastUsedAt` 与 `updatedAt` 都早于 N 天（默认 365） | AutoFill 和 Agent 取用都会更新 `lastUsedAt` |
+| `password_not_rotated` | `passwordChangedAt` 早于 N 天（默认 730） | 修改主秘密时自动记录 |
+| `missing_totp` | 站点支持验证器 2FA 但未存 TOTP | 目前为内置小名单（TODO：2fa.directory 数据） |
+| `trash_not_purged` | 在废纸篓超过 30 天 | — |
+
+输出含 0–100 分、分类计数、按严重度排序的发现（条目 ID、`ak://` 引用、说明、指标）。
+
+### A7.2 清理计划（`CleanupPlan`，已实现）
+
+- Agent 通过 MCP `propose_cleanup` / CLI `agentkey plan create` 创建结构化计划；不传动作时由健康报告自动推导。
+- 动作：`merge`（保留最近使用的一条，合并 URL / 标签 / 备注 / 缺失字段，差异秘密进历史，其余移入废纸篓并打 `merged` 标签）、`trash`、`archive`、`restore`、`flag_rotation`（打 `rotate` 标签）、`add_tags`、`remove_tags`、`purge`（只能清除已在废纸篓的条目）。
+- 校验：未知条目、合并缺 keep、purge 未入废纸篓的条目、重复动作 ID 等一律拒绝。
+- 计划只存条目 ID 和原因（`plans/<id>.json`，0600），不含秘密。
+- **执行只能由人**：`agentkey plan apply <id> [--actions a1,a3]` → `agentkeyd` 弹出 Touch ID / Apple Watch 确认（文案含动作数、计划 ID、提出者、关联码）→ 支持整体或部分批准 → 每个动作写审计 → 计划状态 `applied / partially_applied / rejected`。MCP 不提供 apply 工具。
+- 可逆：除 `purge` 外所有动作都可通过 `restore` 计划撤销，被替换的秘密值保存在条目历史中。
+
+### A7.3 轮换助手（路线图）
+
+1. Agent 根据 `flag_rotation` 列表逐个生成新密码（站点规则可配置）；
+2. 人在网站上修改密码（后续可由 computer-use Agent 在人监督下操作）；
+3. Agent 通过 `rotate_secret` 提交新值 → Touch ID / Watch 批准后写入，旧值进历史，`passwordChangedAt` 更新，`rotate` 标签移除。
+
+## A8. 人用体验（规划）
+
+- **AutoFill 凭据提供扩展**（iOS/iPadOS/macOS）：密码、Passkeys（作为提供者，ES256 软件密钥以便同步）、TOTP 一次性码；`ASCredentialIdentityStore` 维护身份索引；扩展内用 Secure Enclave 快速解锁。
+- **Safari Web 扩展**：网页内识别登录表单、保存新密码、生成密码；与 App 通过 native messaging。
+- **Chrome 扩展**（后续）：同一套 Web 扩展代码，native messaging host 连 `agentkeyd`（需人确认）。
+- **菜单栏快速搜索**（macOS）：⌥⌘\ 呼出，模糊搜索，复制用户名 / 密码 / 验证码（剪贴板 30 秒清除）。
+- **iPhone / iPad App**：浏览、编辑、导入向导、健康报告、审批 Agent 计划。
+
+## A9. 路线图
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| **Phase 1 — Mac 核心 + Agent 通道** | AgentKeyCore（2SKD、逐条加密、TOTP、生成器）、`agentkeyd` + Touch ID/Watch 审批、CLI、MCP、审计、`--json`、输出脱敏 | ✅ v0.1（Mac 实测中） |
+| **Phase 1.5 — 迁移 + Agent 维护 + 同步模型** | 导入器（1Password/Apple/Chrome/Firefox/Bitwarden/CSV）、健康分析、清理计划、Lamport + 墓碑 + 三方合并、CKSyncEngine 骨架 | ✅ 本次（同步适配器待 Mac 验证） |
+| **Phase 2 — 存储 + 同步落地** | SQLite 加密记录库、CKSyncEngine 实测、Argon2id、Secure Enclave 快速解锁、签名 App + App Group + 钥匙串 ACL | ⏳ |
+| **Phase 3 — 全端人用体验** | iPhone / iPad / Mac App、AutoFill 扩展（密码 + TOTP）、菜单栏快速搜索、导入向导 | ⏳ |
+| **Phase 4 — Passkeys + 浏览器** | Passkeys 提供者、Safari Web 扩展、Chrome 扩展（native messaging） | ⏳ |
+| **Phase 5 — 高级 Agent 能力** | 轮换助手、`http` / `inject` / `fill` 模式、授权（grants）与撤销、iPhone 远程审批、HPKE 加密审计 | ⏳ |
+
+---
+
+# Part B：早期方案正文（NVault，已改名）
+
+> 已做命名替换：NVault→AgentKey，`nvault`→`agentkey`，`nv://`→`ak://`，`com.neilxu.nvault`→`com.neardws.agentkey`。§6（本地存储）、§7（同步）、§16（路线图）已被 Part A 的 A4、A5、A9 取代。
+
 > 与 §0 冲突之处以 §0 和代码为准。
 
 # AgentKey 技术设计文档 —— Neil Xu 个人密码管理器（类 1Password）
@@ -426,7 +556,7 @@ AEAD 格式：`version(1B) || nonce(12B) || ciphertext || tag(16B)`；AAD = `"nv
 
 ---
 
-## 6. 本地存储与内存安全
+## 6. 本地存储与内存安全（已被 Part A §A4 取代，内存安全部分仍有效）
 
 - **数据库**：SQLite（建议 GRDB.swift 或直接 `sqlite3` C API），位于 App Group 容器 `group.com.neardws.agentkey`。表：`account`、`vault`、`item`（存 EncryptedItem 字段）、`item_revision`、`sync_state`、`audit`。数据库文件整体只存密文字段，无需 SQLCipher；文件本身加 `NSFileProtectionComplete`（iOS）。
 - **不使用 SwiftData / Core Data 存秘密**：便于精确控制加密边界与同步格式。主 App 可用 `@Observable` 视图模型包裹解密后的内存模型。
@@ -439,7 +569,7 @@ AEAD 格式：`version(1B) || nonce(12B) || ciphertext || tag(16B)`；AAD = `"nv
 
 ---
 
-## 7. iCloud（CloudKit）同步与冲突
+## 7. iCloud（CloudKit）同步与冲突（已被 Part A §A5 取代）
 
 ### 7.1 基本选择
 
@@ -1423,7 +1553,7 @@ agentkey status
 
 ---
 
-## 16. 分阶段 MVP 路线图
+## 16. 分阶段 MVP 路线图（已被 Part A §A9 取代，仅供参考）
 
 > 时间估计以 Neil 业余 / 半职投入为基准，仅供排期参考。
 
