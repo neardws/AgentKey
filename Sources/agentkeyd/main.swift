@@ -44,7 +44,7 @@ if args.contains("--sync-node") {
         }
         do { _ = try node.initHome(vaultID: vid) } catch { FileHandle.standardError.write(Data("agentkeyd: \(error)\n".utf8)); exit(1) }
     }
-    let host = argValue("--sync-host") ?? "0.0.0.0"
+    let host = argValue("--sync-host") ?? "::"     // dual-stack: IPv4 + direct IPv6
     let tcp: TCPListener
     do { tcp = try TCPListener(host: host, port: daemon.syncPort) }
     catch { FileHandle.standardError.write(Data("agentkeyd: sync listener: \(error)\n".utf8)); exit(1) }
@@ -75,13 +75,21 @@ if args.contains("--sync-node") {
     }.start()
 }
 
+// Connectivity (STUN, UDP hole punching, BEP 44 DHT rendezvous). --no-net disables all of it;
+// sync/net.json configures STUN servers, DHT, forwarded endpoints and an optional relay.
+daemon.netDisabled = args.contains("--no-net")
+daemon.isSyncNode = args.contains("--sync-node")
+if !daemon.netDisabled { daemon.startNetIfNeeded() }
+
 // Background client sync for paired devices (every --sync-interval seconds, default 300; 0 disables).
 let syncInterval = argValue("--sync-interval").flatMap(Double.init) ?? 300
 if syncInterval > 0 {
     Thread {
         while true {
             Thread.sleep(forTimeInterval: syncInterval)
-            guard let node = daemon.sync, node.replica != nil, !node.peers.endpoints.isEmpty else { continue }
+            daemon.startNetIfNeeded()
+            guard let node = daemon.sync, node.replica != nil, !node.peers.endpoints.isEmpty || node.net != nil else { continue }
+            if args.contains("--sync-node") && node.peers.endpoints.isEmpty { continue }   // a lone home node just serves
             daemon.reconcileVault(); _ = try? node.syncNow(); daemon.reconcileVault()
         }
     }.start()

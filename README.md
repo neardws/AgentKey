@@ -74,7 +74,8 @@ AutoFill everywhere on Mac, iPhone and iPad · end-to-end encrypted peer-to-peer
 
 ## Build & run on the Mac mini
 
-Requirements: macOS 14+ (tested target: macOS 27, Xcode 26.2, Swift 6.2). For approvals you need **either** a
+Requirements: macOS 14+ (tested target: macOS 27, Xcode 26.2, Swift 6.2). Command Line Tools only (no Xcode) is enough
+for `swift build`; `swift test` needs XCTest, which some CLT releases lack — use Xcode for tests in that case. For approvals you need **either** a
 Magic Keyboard with Touch ID **or** an Apple Watch with *System Settings → Touch ID & Password → Apple Watch* enabled.
 
 ```bash
@@ -139,6 +140,25 @@ fingerprint>` and TXT `v=<protocol>`, `fp=<8-char fingerprint>` only — no devi
 connection still pins the node's full fingerprint in the Noise handshake, so a spoofed advertisement gets nowhere.
 Disable with `agentkeyd --no-bonjour` or `AGENTKEY_NO_BONJOUR=1`.
 
+**Different networks / NAT traversal (no AgentKey server):** devices race candidates ICE-style — LAN Bonjour → direct
+IPv6 → configured/forwarded `host:port` → UDP hole punching → relay (off by default, your own only). Public address via
+a built-in STUN client (Google, Cloudflare, Xiaomi, Tencent servers by default; configurable). Candidates are exchanged
+through the BitTorrent Mainline DHT (BEP 44 items signed with per-pair keys and encrypted to the peer — unlinkable to
+your devices), or by copy-paste (`agentkey sync signal export|import`), or from last-known endpoints. The Noise handshake
+with the pinned fingerprint remains the only trust anchor.
+
+```bash
+agentkey net probe                 # STUN results, NAT type, global IPv6, our candidates, DHT status
+agentkey sync now -v               # race all candidates, show every attempt
+agentkey sync now --via udp -v     # force hole punching (or lan | ipv6 | tcp)
+agentkey sync signal export        # if the DHT is unreachable: paste the blob on the other device…
+agentkey sync signal import 'akr1.…'
+```
+Config: `~/Library/Application Support/AgentKey/sync/net.json` —
+`{"stunServers":[…], "dht":true, "udpPort":7373, "forwardedEndpoints":["203.0.113.5:7373"], "relay":null}`;
+`agentkeyd --no-net` disables STUN/DHT/UDP entirely. Hole punching fails if both sides have symmetric NATs or UDP is
+swallowed by a proxy/VPN — then use IPv6, a forwarded port, or Tailscale/WireGuard.
+
 **macOS Local Network prompt:** SwiftPM-built CLI binaries have no Info.plist, so macOS attributes their LAN access to the
 *responsible* app. `agentkeyd` started by the LaunchAgent gets its own entry; `agentkey sync discover --local` or
 `agentkeyd` run from a shell may trigger the prompt for **your terminal app** (Terminal / iTerm / Ghostty). Allow it in
@@ -177,6 +197,7 @@ Set the client's tool timeout ≥ 90 s — approvals wait up to 60 s.
 | 1 | Mac core + agent channel: crypto, vault, `agentkeyd` Touch ID/Watch approvals, CLI, MCP, audit, `--json`, redaction | ✅ v0.1 |
 | 1.5 | Importers, vault health + cleanup plans, sync model (Lamport, tombstones, 3-way merge) | ✅ v0.2 |
 | 1.6 | No external services: home-node + P2P sync (Noise XX, QR pairing, revocation + key rotation), encrypted backup, `device`/`sync`/`backup` CLI; CloudKit demoted to an off-by-default legacy module | ✅ v0.3 (Bonjour discovery: Mac runtime validation pending) |
+| 1.7 | NAT traversal: STUN, candidate racing, BEP 44 DHT rendezvous, manual signalling, UDP hole punching + reliable UDP stream, `net probe` | ✅ (live STUN/DHT: Mac validation pending) |
 | 2 | Encrypted SQLite record store, Bonjour discovery + Multipeer, iOS background sync, QR scanner UI, Argon2id, Secure Enclave unlock, signed app + App Group | ⏳ |
 | 3 | iPhone / iPad / Mac apps, AutoFill extension (passwords + TOTP), menu-bar quick search, import wizard | ⏳ |
 | 4 | Passkeys provider, Safari web extension, Chrome extension | ⏳ |
@@ -205,6 +226,7 @@ Agent 可以"使用"你的密码和 API Key，但每一次释放都必须由你�
 
 - **家庭节点**：Mac mini 上运行 `agentkeyd --sync-node`（TCP 7373，局域网 / Tailscale / WireGuard）。
 - **配对**：节点上 `agentkey device pair` 显示一次性二维码（含节点地址、一次性密钥、节点公钥指纹，10 分钟过期、单次有效）；新设备 `agentkey device pair <码>`。Noise XX + psk 双向认证，新设备先核对指纹再暴露身份；保险库同步密钥在加密信道里交给新设备。
+- **跨网络 / NAT 穿透**（不需要 AgentKey 服务器）：候选竞速——局域网 Bonjour → IPv6 直连 → 配置/端口转发的 `host:port` → UDP 打洞 → 中继（默认关闭）。内置 STUN 客户端（默认含小米、腾讯等国内可达服务器）；候选通过 BitTorrent DHT（BEP 44，每对设备派生的密钥签名并加密，外人无法关联）或手工 `agentkey sync signal export|import` 交换。`agentkey net probe` 查看 NAT 类型和候选，`agentkey sync now --via udp -v` 查看每次尝试。两边都是对称 NAT 或 UDP 被代理/VPN 拦截时无法打洞，请用 IPv6、端口转发或 Tailscale/WireGuard。
 - **局域网发现**：家庭节点通过 Bonjour 广播 `_agentkey._tcp`（实例名 `agentkey-<指纹前 8 位>`，TXT 只有协议版本和短指纹，不含设备名或保险库信息）；`agentkey sync discover --json` 列出局域网内的节点。配对码优先写 `bonjour:<名字>`，失败再回退 `host:port`。发现只提供地址，信任仍由 Noise 握手中的完整指纹决定。`--no-bonjour` / `AGENTKEY_NO_BONJOUR=1` 可关闭广播。macOS 上从终端运行的 SwiftPM 命令行程序可能会让**终端 App** 弹出“本地网络”权限请求，在“系统设置 → 隐私与安全性 → 本地网络”里允许即可。
 - **同步**：`agentkey sync now | status --json`，后台每 5 分钟一次；增量、可断点续传、幂等，线上只有加密记录；冲突用三方合并，落败的秘密进条目历史。
 - **丢失设备**：`agentkey device revoke`，所有设备握手时拒绝它，并立即轮换保险库同步密钥。

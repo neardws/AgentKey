@@ -147,6 +147,30 @@ CREATE TABLE search_index(           -- 加密的搜索索引（标题/域名 to
 | **恶意已配对设备** | 推送垃圾或删除 | 删除只是墓碑 + 历史可恢复；审计记录来源设备；撤销该设备。 |
 | **备份文件泄露** | 离线暴力破解 | PBKDF2 600k + 口令长度下限；建议用生成的长口令单独保存。 |
 
+### A5.10 跨网络 / NAT 穿透（ICE 式候选竞速，无自有服务器）
+
+场景：两台 Mac mini 在不同网络、都在 NAT 后（一台有全局 IPv6 `2408:…`，另一台只有 IPv4 `192.168.5.x`），且 HTTP 出口走系统代理/VPN（不能依赖 HTTP 回显 IP）。代码：`Sources/AgentKeyCore/Net/`。
+
+- **一个 UDP 端口复用一切**（`UDPMux`，默认 7373/udp）：STUN、打洞、可靠 UDP 流、DHT 客户端共用同一个 socket，因此 STUN 看到的映射就是对端要打洞的映射。
+- **地址发现**：自写最小 STUN 客户端（RFC 5389 Binding，XOR-MAPPED-ADDRESS、FINGERPRINT；RFC 5769 测试向量通过）。默认服务器 `stun.l.google.com:19302`、`stun.cloudflare.com:3478`、`stun.miwifi.com:3478`、`stun.qq.com:3478`（国内可达），可在 `sync/net.json` 改。NAT 类型估计：所有服务器看到同一映射 → endpoint-independent（可打洞）；不同 → endpoint-dependent（对称型，打洞多半失败）；无应答 → udp-blocked（代理/VPN 吃掉 UDP）。STUN 只发 Binding 请求，不含任何身份或保险库数据。
+- **候选**（按竞速顺序）：局域网 Bonjour → 直连 IPv6（`[2408:…]:7373`，需路由器防火墙放行入站）→ 配置的 / 端口转发的 `host:port` → UDP 打洞（srflx / host）→ 中继（**默认关闭**；只能是你自己配置的 TCP 中继）。`Connectivity.race` 按 happy-eyeballs 方式错开 300 ms 依次发起，先连上的赢；每次尝试都记录在诊断里（`agentkey sync now -v`）。成功的端点写回 `peers.json` 作为“上次可用”，下次优先。
+- **信令 / 会合（无自有服务器）**：`RendezvousProvider` 协议，三种实现：
+  1. **BitTorrent Mainline DHT BEP 44 可变条目**（默认）：每对设备、每个方向一个 ed25519 密钥 + salt，由两台设备静态密钥的 X25519 共享秘密经 HKDF 派生——外人无法把 DHT 条目关联到设备身份；值是用同一共享秘密派生的 ChaChaPoly 密钥加密的候选记录（方向绑定的 AAD），≤ 1000 字节。自写 bencode / KRPC 客户端（迭代 `get`、带 token 的 `put`，BEP 43 只读）。引导节点 `router.bittorrent.com` 等可配置。
+  2. **手工**：`agentkey sync signal export` 打印 `akr1.…`，在另一台 `agentkey sync signal import` 粘贴（任何聊天工具都行，内容已加密且只有对端能解）。
+  3. **上次可用端点**（`peers.json`）。
+- **UDP 打洞**：双方同时向对方所有 UDP 候选每 100 ms 发 PUNCH（带配对密钥 HMAC，陌生流量不能开会话）；hub 轮询 DHT（默认 30 s）拿到客户端新鲜记录后也主动向其打洞（同时打开），收到对端打洞包时把真实来源端点加入目标。成功后在其上跑**可靠 UDP 流**（go-back-N，累计 ACK，指数退避 RTO，1100 字节分段，长度前缀帧），Noise 会话照常运行。
+- **信任锚不变**：无论走哪条路径，都是 Noise XX + 钉住的完整公钥指纹；DHT、STUN、Bonjour 只提供地址。
+- **后台**：守护进程每 25 s 刷新 STUN（兼做 NAT 保活）、每 5 分钟重新发布候选、每 30 s 轮询对端记录。`--no-net` 全部关闭。
+- **测试**：RFC 5769 向量、本地 STUN 服务器、bencode / BEP 44 签名缓冲区、本地 KRPC 节点上的 put/get、记录加密 / 方向绑定 / 篡改、候选排序与竞速、两个模拟“地址受限 NAT”（只接收自己发过包的地址）的 socket 在回环上打洞（单边打洞被丢弃、同时打洞成功）并在 10–15% 丢包下跑完整 Noise + 同步。
+- **局限**：两边都是对称 NAT，或 UDP 被代理/VPN 拦截时，打洞不可行——用 IPv6 直连（有 v6 的一侧做 home node）、端口转发，或 Tailscale/WireGuard；中继需你自己提供。
+
+| 威胁 | 对策 |
+|---|---|
+| DHT 观察者 | 条目键与 salt 由配对共享秘密派生、每方向不同，看不出属于哪台设备；值已加密，只泄露“某个 ~500 字节的条目存在且被更新” |
+| DHT 投毒 / 伪造候选 | BEP 44 签名 + AEAD；即便地址被替换，Noise 指纹校验会拒绝 |
+| 打洞端口被扫描 | 无有效 HMAC 的 PUNCH 被忽略；只有完成认证打洞的地址才能开流 |
+| STUN 服务器 | 只看到你的公网地址和端口（与任何 UDP 连接相同）；可换成自建或关闭 |
+
 ### A5.9 遗留：CloudKit（默认关闭）
 
 `CloudKitSyncAdapter.swift` 仅在 Apple 平台且编译标志 `AGENTKEY_LEGACY_CLOUDKIT` 打开时编译，未验证、不在路线图内。默认构建不包含任何云组件。
@@ -219,6 +243,7 @@ CREATE TABLE search_index(           -- 加密的搜索索引（标题/域名 to
 |---|---|---|
 | **Phase 1 — Mac 核心 + Agent 通道** | AgentKeyCore（2SKD、逐条加密、TOTP、生成器）、`agentkeyd` + Touch ID/Watch 审批、CLI、MCP、审计、`--json`、输出脱敏 | ✅ v0.1（Mac 实测中） |
 | **Phase 1.5 — 迁移 + Agent 维护 + 同步模型** | 导入器（1Password/Apple/Chrome/Firefox/Bitwarden/CSV）、健康分析、清理计划、Lamport + 墓碑 + 三方合并 | ✅ |
+| **Phase 1.7 — 跨网络 NAT 穿透** | STUN、候选竞速、DHT BEP44 会合、手工信令、UDP 打洞 + 可靠 UDP 流、`net probe`、`sync now --via` | ✅ Linux 测试通过；公网 DHT/STUN 需在 Mac 上实测（构建机无 UDP 出口） |
 | **Phase 1.6 — 零外部服务同步** | Noise XX 信道、设备身份、二维码配对、家庭节点 `agentkeyd --sync-node`、P2P 增量同步、撤销 + 密钥轮换、加密离线备份、`device`/`sync`/`backup` 命令；CloudKit 降为默认关闭的遗留模块 | ✅ Linux 测试通过；Bonjour/NW 传输、SE 包裹身份密钥待 Mac 验证 |
 | **Phase 2 — 存储 + 同步落地** | SQLite 加密记录库、Bonjour 自动发现 + Multipeer、iOS 后台同步、二维码扫描 UI、Argon2id、Secure Enclave 快速解锁、签名 App + App Group + 钥匙串 ACL | ⏳ |
 | **Phase 3 — 全端人用体验** | iPhone / iPad / Mac App、AutoFill 扩展（密码 + TOTP）、菜单栏快速搜索、导入向导 | ⏳ |

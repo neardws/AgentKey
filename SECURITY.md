@@ -62,3 +62,13 @@ Does **not** protect against (known limitations):
   untrusted addressing — the full fingerprint is pinned in the handshake. Disable with `--no-bonjour`.
 - Not yet validated on Apple hardware: Bonjour runtime behaviour, Keychain + Secure Enclave wrapping of
   the device identity key (on Linux it is a 0600 file).
+
+## NAT traversal (v0.4)
+
+- No AgentKey-operated server. External contacts: public STUN servers (binding requests only; they learn your public
+  IP:port), and the BitTorrent Mainline DHT (stores ≤1000-byte items under keys derived from a per-pair secret,
+  encrypted to the peer, signed with ed25519 — not linkable to your device identities). Both configurable;
+  `agentkeyd --no-net` disables them.
+- UDP hole-punch packets carry an HMAC from the per-pair key; streams open only from endpoints that completed an
+  authenticated punch. The Noise handshake with the pinned fingerprint is still the trust anchor on every path.
+- The UDP port (default 7373/udp) is open to whoever learns it; unauthenticated packets are dropped.

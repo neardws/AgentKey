@@ -187,7 +187,7 @@ while let line = readLine(strippingNewline: true) {
         send(["jsonrpc": "2.0", "id": id, "result": [
             "protocolVersion": requested,
             "capabilities": ["tools": ["listChanged": false]],
-            "serverInfo": ["name": "agentkey", "version": "0.3.0"],
+            "serverInfo": ["name": "agentkey", "version": "0.4.0"],
             "instructions": "Secrets require the user's Touch ID / Apple Watch approval on their Mac (may take up to 60s). Prefer run_with_secret so plaintext never enters your context."]])
     case "ping":
         send(["jsonrpc": "2.0", "id": id, "result": [:] as [String: Any]])

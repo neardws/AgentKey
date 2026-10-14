@@ -21,6 +21,26 @@ final class Daemon: @unchecked Sendable {
     /// Bonjour instance name when this node advertises on the LAN (nil = not advertising).
     var bonjourName: String?
     var bonjourListener: AnyObject?
+    var netDisabled = false
+    var netStarted = false
+    var isSyncNode = false
+
+    /// Start the connectivity runtime (STUN, UDP punching, DHT rendezvous) once a replica exists.
+    func startNetIfNeeded() {
+        guard !netDisabled, !netStarted, let node = sync, node.replica != nil else { return }
+        let cfg = NetConfig.load(AKPaths.syncDir.appendingPathComponent("net.json"))
+        do {
+            let net = try NetRuntime(node: node, config: cfg, tcpPort: syncPort)
+            net.bonjourName = bonjourName
+            net.listensTCP = isSyncNode
+            net.log = { print("net: \($0)") }
+            net.beforeServe = { [weak self] in self?.reconcileVault() }
+            net.afterServe = { [weak self] in self?.reconcileVault() }
+            node.net = net; netStarted = true
+            net.startBackground()
+            print("agentkeyd net: udp \(net.mux.localPort), dht \(cfg.dht ? "on" : "off"), stun \(cfg.stunServers.count) server(s)\(cfg.relay.map { ", relay " + $0 } ?? "")")
+        } catch { print("agentkeyd net: disabled (\(error))") }
+    }
 
     /// Reconcile vault file <-> sync replica when the vault is unlocked (no-op when locked).
     @discardableResult
@@ -227,14 +247,40 @@ final class Daemon: @unchecked Sendable {
                 let node = try requireSync()
                 return RPCMessage(id: req.id, result: ["status": try jsonString(node.status())])
 
+            case "net.probe":
+                let node = try requireSync()
+                startNetIfNeeded()
+                guard let net = node.net else { throw RPCError(.notFound, netDisabled ? "networking disabled (--no-net)" : SyncNodeError.notInitialized.description) }
+                return RPCMessage(id: req.id, result: ["probe": try jsonString(net.probe())])
+
+            case "sync.signal.export":
+                let node = try requireSync(); startNetIfNeeded()
+                guard let net = node.net, let r = node.replica else { throw RPCError(.notFound, SyncNodeError.notInitialized.description) }
+                let q = req.params["to"]
+                var blobs: [[String: String]] = []
+                for d in r.trust.devices.values where d.revokedAt == nil && d.deviceID != node.identity.deviceID.raw {
+                    if let q, !(d.deviceID.hasPrefix(q.lowercased()) || d.name == q) { continue }
+                    blobs.append(["device": d.deviceID, "name": d.name, "blob": try net.exportSignal(peer: d.deviceID)])
+                }
+                if blobs.isEmpty { throw RPCError(.notFound, "no matching paired device") }
+                return RPCMessage(id: req.id, result: ["signals": try jsonString(blobs)])
+
+            case "sync.signal.import":
+                let node = try requireSync(); startNetIfNeeded()
+                guard let net = node.net, let blob = req.params["blob"] else { throw RPCError(.usage, "blob required") }
+                let (peer, rec) = try net.importSignal(blob)
+                return RPCMessage(id: req.id, result: ["device": peer, "name": node.replica?.trust.devices[peer]?.name ?? "", "candidates": try jsonString(rec.c), "nat": rec.n])
+
             case "sync.now":
                 let node = try requireSync()
                 guard node.replica != nil else { throw RPCError(.notFound, SyncNodeError.notInitialized.description) }
+                startNetIfNeeded()
+                let via = ConnectVia(rawValue: req.params["via"] ?? "auto") ?? .auto
                 if Discovery.supported && req.params["discover"] != "false" {
                     try? node.learnDiscovered(Discovery.browse(timeout: 2).nodes)
                 }
                 let pre = reconcileVault()
-                let res = try node.syncNow()
+                let res = try node.syncNow(via: via)
                 let post = reconcileVault()
                 var peers: [[String: String]] = []
                 for (p, r) in res.sorted(by: { $0.key < $1.key }) {
@@ -245,7 +291,7 @@ final class Daemon: @unchecked Sendable {
                     }
                 }
                 log("sync_now", agent: agent, detail: "\(peers.count) peer(s)", peer: peer)
-                return RPCMessage(id: req.id, result: ["peers": try jsonString(peers), "vaultUnlocked": String(pre != nil),
+                return RPCMessage(id: req.id, result: ["peers": try jsonString(peers), "diagnostics": try jsonString(node.lastDiagnostics), "via": via.rawValue, "vaultUnlocked": String(pre != nil),
                                                        "toReplica": String((pre?.0 ?? 0) + (post?.0 ?? 0)), "toVault": String((pre?.1 ?? 0) + (post?.1 ?? 0))])
 
             case "sync.discover":
@@ -272,6 +318,7 @@ final class Daemon: @unchecked Sendable {
                 if let b = bonjourName { hosts.append(SyncEndpoint.bonjourPrefix + b) }
                 if let h = req.params["hosts"] { hosts += h.split(separator: ",").map(String.init) }
                 hosts += extraHosts
+                hosts += LocalAddresses.ipv6Global()
                 hosts += LocalAddresses.ipv4()
                 let ttl = TimeInterval(req.params["ttl"].flatMap(Int.init) ?? 600)
                 let p = try node.makeOffer(hosts: hosts, port: syncPort, ttl: ttl)
@@ -286,6 +333,7 @@ final class Daemon: @unchecked Sendable {
                 try await humanApprove("join the sync group of \(PromptSanitizer.clean(payload.nodeName, max: 40)) (fingerprint \(payload.fingerprint))", ref: "device_pair_join", agent: agent, conn: conn, peer: peer)
                 do { _ = try node.join(payload) } catch { throw RPCError(.userDenied, "pairing failed: \(error)") }
                 let r = reconcileVault()
+                startNetIfNeeded()
                 _ = try? node.syncNow(); reconcileVault()
                 log("device_paired", agent: agent, ref: payload.fingerprint, peer: peer)
                 return RPCMessage(id: req.id, result: ["ok": "true", "deviceID": node.identity.deviceID.raw, "fingerprint": node.identity.fingerprint,
@@ -369,4 +417,4 @@ final class Daemon: @unchecked Sendable {
 
 final class Box<T>: @unchecked Sendable { var value: T? }
 
-public enum AgentKeyVersion { public static let string = "0.3.0" }
+public enum AgentKeyVersion { public static let string = "0.4.0" }

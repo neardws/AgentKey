@@ -39,6 +39,10 @@ SYNC (no cloud, no server: your devices + an always-on home node, e.g. a Mac min
   agentkey device revoke <device-id|name|fingerprint>       human-only; rotates the vault key
   agentkey sync now | status                                sync with the home node now / show state
   agentkey sync discover [--timeout S] [--local]            list AgentKey nodes advertising _agentkey._tcp on the LAN
+  agentkey sync now [--via auto|lan|ipv6|tcp|udp] [-v]      race candidates (LAN → IPv6 → TCP → UDP punch); -v: diagnostics
+  agentkey sync signal export [--to <device>]               copy-paste rendezvous blob (when the DHT is unreachable)
+  agentkey sync signal import <akr1.…>                      import the other device's blob
+  agentkey net probe                                        STUN results, NAT type, IPv6, our candidates, DHT status
   agentkey backup export <file>                             encrypted offline backup (passphrase; $AGENTKEY_BACKUP_PASSPHRASE)
   agentkey backup restore <file>                            human-only; merges items into the vault
 
@@ -533,11 +537,31 @@ case "device", "sync":
                 print("  \(nm)  fp \(fp)…  v\(n["protocolVersion"] ?? "?")  [\(ifs)]  \(paired)")
             }
         }
+    case ("sync", "signal"):
+        guard let op = argv.first else { die("usage: agentkey sync signal export [--to dev] | import <blob>") }
+        argv.removeFirst()
+        if op == "export" {
+            var p = ["agent": agentLabel()]; if let t = opt("--to") { p["to"] = t }
+            let r = rpc(client(), "sync.signal.export", p)
+            let sigs = (try? JSONSerialization.jsonObject(with: Data((r["signals"] ?? "[]").utf8))) as? [[String: String]] ?? []
+            if Out.json { Out.emit(["signals": sigs]) }
+            else { for x in sigs { print("# for \(x["name"] ?? "") (\(String((x["device"] ?? "").prefix(8)))) — paste on that device: agentkey sync signal import '<blob>'"); print(x["blob"] ?? "") } }
+        } else if op == "import" {
+            guard let blob = argv.first else { die("usage: agentkey sync signal import <akr1.…>") }
+            let r = rpc(client(), "sync.signal.import", ["blob": blob, "agent": agentLabel()])
+            let c = (try? JSONSerialization.jsonObject(with: Data((r["candidates"] ?? "[]").utf8))) ?? []
+            if Out.json { Out.emit(["imported": ["device": r["device"] ?? "", "name": r["name"] ?? "", "nat": r["nat"] ?? "", "candidates": c]]) }
+            else { print("✅ imported candidates of \(r["name"] ?? "") (NAT \(r["nat"] ?? "?")); run `agentkey sync now -v`") }
+        } else { die("usage: agentkey sync signal export|import") }
     case ("sync", "now"):
-        let r = rpc(client(), "sync.now", ["agent": agentLabel()])
+        let verbose = flag("-v") || flag("--verbose")
+        var sp = ["agent": agentLabel()]
+        if let v = opt("--via") { guard ConnectVia(rawValue: v) != nil else { die("--via must be one of auto, lan, ipv6, tcp, udp") }; sp["via"] = v }
+        let r = rpc(client(), "sync.now", sp)
+        let diags = (try? JSONSerialization.jsonObject(with: Data((r["diagnostics"] ?? "{}").utf8))) as? [String: Any] ?? [:]
         let peers = (try? JSONSerialization.jsonObject(with: Data((r["peers"] ?? "[]").utf8))) as? [[String: String]] ?? []
         if Out.json {
-            var o: [String: Any] = ["peers": peers, "vaultUnlocked": r["vaultUnlocked"] == "true"]
+            var o: [String: Any] = ["peers": peers, "vaultUnlocked": r["vaultUnlocked"] == "true", "via": r["via"] ?? "auto", "diagnostics": diags]
             o["toReplica"] = Int(r["toReplica"] ?? "") ?? 0; o["toVault"] = Int(r["toVault"] ?? "") ?? 0
             Out.emit(["sync": o])
         }
@@ -548,9 +572,40 @@ case "device", "sync":
                 else { print("❌ \(p["name"] ?? ""): \(p["error"] ?? "")") }
             }
             if r["vaultUnlocked"] != "true" { print("(vault locked: replica synced; items merge into the vault on next unlock)") }
+            if verbose {
+                for (peer, list) in diags {
+                    print("connection attempts for \(peer.prefix(8)):")
+                    for a in list as? [[String: Any]] ?? [] {
+                        let ok = (a["ok"] as? Bool) == true ? "✓" : "✗"
+                        let kind = a["kind"] as? String ?? "", cand = a["candidate"] as? String ?? "", ms = a["ms"] as? Int ?? 0
+                        print("  \(ok) \(kind.padding(toLength: 7, withPad: " ", startingAt: 0)) \(cand)  \(ms) ms  \(a["error"] as? String ?? "")")
+                    }
+                }
+            }
         }
     default:
         die("usage: agentkey device pair|list|revoke  /  agentkey sync now|status")
+    }
+
+case "net":
+    guard argv.first == "probe" else { die("usage: agentkey net probe [--json]") }
+    let r = rpc(client(), "net.probe", ["agent": agentLabel()])
+    let probe = (try? JSONSerialization.jsonObject(with: Data((r["probe"] ?? "{}").utf8))) as? [String: Any] ?? [:]
+    if Out.json { Out.emit(["net": probe]) }
+    else {
+        print("UDP port: \(probe["udpPort"] ?? "?")   NAT: \(probe["natType"] ?? "?")   public IPv4: \((probe["publicIPv4"] as? [String] ?? []).joined(separator: ", "))")
+        print("LAN IPv4: \((probe["localIPv4"] as? [String] ?? []).joined(separator: ", "))   global IPv6: \((probe["globalIPv6"] as? [String] ?? []).joined(separator: ", "))")
+        print("STUN:")
+        for x in probe["stun"] as? [[String: Any]] ?? [] {
+            let srv = x["server"] as? String ?? "", res = (x["mapped"] as? String) ?? (x["error"] as? String ?? "")
+            print("  \(srv.padding(toLength: 28, withPad: " ", startingAt: 0)) \(res)\((x["rttMs"] as? Int).map { "  \($0) ms" } ?? "")")
+        }
+        print("candidates:")
+        for c in probe["candidates"] as? [[String: Any]] ?? [] { print("  \((c["kind"] as? String ?? "").padding(toLength: 8, withPad: " ", startingAt: 0)) \(c["addr"] ?? "")  (\(c["source"] ?? ""))") }
+        if let d = probe["dht"] as? [String: Any] {
+            print("DHT: \((d["enabled"] as? Bool) == true ? "on" : "off"), last publish \(d["lastPublish"] ?? "never") ok=\(d["lastPublishOK"] ?? "-") nodes=\(d["nodesAccepted"] ?? "-"), queries \(d["queries"] ?? 0) / responses \(d["responses"] ?? 0)")
+        }
+        for n in probe["notes"] as? [String] ?? [] { print("• \(n)") }
     }
 
 case "backup":
