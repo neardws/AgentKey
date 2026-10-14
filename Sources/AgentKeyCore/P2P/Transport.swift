@@ -76,17 +76,30 @@ public final class TCPTransport: FrameTransport, @unchecked Sendable {
         hints.ai_socktype = Int32(SOCK_STREAM.rawValue)
         #endif
         var res: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, String(port), &hints, &res) == 0, let first = res else { throw TransportError.connectFailed("resolve \(host)") }
+        let h = host.hasPrefix("[") && host.hasSuffix("]") ? String(host.dropFirst().dropLast()) : host
+        guard getaddrinfo(h, String(port), &hints, &res) == 0, let first = res else { throw TransportError.connectFailed("resolve \(host)") }
         defer { freeaddrinfo(res) }
         var p: UnsafeMutablePointer<addrinfo>? = first
         while let ai = p {
             let fd = socket(ai.pointee.ai_family, ai.pointee.ai_socktype, ai.pointee.ai_protocol)
             if fd >= 0 {
+                // non-blocking connect with timeout (so candidate racing is not stuck on a filtered address)
+                let flags = fcntl(fd, F_GETFL, 0)
+                _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
                 #if canImport(Darwin)
-                let rc = Darwin.connect(fd, ai.pointee.ai_addr, ai.pointee.ai_addrlen)
+                var rc = Darwin.connect(fd, ai.pointee.ai_addr, ai.pointee.ai_addrlen)
                 #else
-                let rc = Glibc.connect(fd, ai.pointee.ai_addr, ai.pointee.ai_addrlen)
+                var rc = Glibc.connect(fd, ai.pointee.ai_addr, ai.pointee.ai_addrlen)
                 #endif
+                if rc != 0 && errno == EINPROGRESS {
+                    var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+                    if poll(&pfd, 1, Int32(timeout * 1000)) == 1 {
+                        var err: Int32 = 0; var len = socklen_t(MemoryLayout<Int32>.size)
+                        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len)
+                        rc = err == 0 ? 0 : -1; if err != 0 { errno = err }
+                    } else { errno = ETIMEDOUT }
+                }
+                _ = fcntl(fd, F_SETFL, flags)
                 if rc == 0 { return TCPTransport(fd: fd, peer: "\(host):\(port)") }
                 Darwin_or_Glibc_close(fd)
             }
@@ -147,26 +160,26 @@ public final class TCPListener: @unchecked Sendable {
     public let port: UInt16
 
     /// Bind to `host` (default all interfaces) and `port` (0 = ephemeral).
+    /// `host` "::" (or any IPv6 literal) = dual-stack IPv6 socket (also accepts IPv4); falls back to IPv4.
     public init(host: String = "0.0.0.0", port: UInt16 = 0) throws {
         #if canImport(Darwin)
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        let stream = SOCK_STREAM
         #else
-        let fd = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        let stream = Int32(SOCK_STREAM.rawValue)
         #endif
-        self.fd = fd
+        var ep = IPEndpoint(host: host, port: port)
+        var fd: Int32 = socket(ep.isIPv6 ? AF_INET6 : AF_INET, stream, 0)
+        if fd < 0 && ep.isIPv6 { ep = IPEndpoint(host: "0.0.0.0", port: port); fd = socket(AF_INET, stream, 0) }
         guard fd >= 0 else { throw TransportError.connectFailed("socket") }
-        var one: Int32 = 1
+        var one: Int32 = 1, zero: Int32 = 0
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
-        var a = sockaddr_in()
-        a.sin_family = sa_family_t(AF_INET)
-        a.sin_port = port.bigEndian
-        inet_pton(AF_INET, host, &a.sin_addr)
-        let rc = withUnsafePointer(to: &a) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
-        guard rc == 0, listen(fd, 16) == 0 else { Darwin_or_Glibc_close(fd); throw TransportError.connectFailed("bind \(host):\(port)") }
-        var b = sockaddr_in(); var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        _ = withUnsafeMutablePointer(to: &b) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) } }
-        self.port = UInt16(bigEndian: b.sin_port)
+        if ep.isIPv6 { setsockopt(fd, Int32(IPPROTO_IPV6), IPV6_V6ONLY, &zero, socklen_t(MemoryLayout<Int32>.size)) }
+        let rc = (try? ep.withSockaddr { bind(fd, $0, $1) }) ?? -1
+        guard rc == 0, listen(fd, 16) == 0 else { Darwin_or_Glibc_close(fd); throw TransportError.connectFailed("bind \(ep)") }
+        self.fd = fd
+        var ss = sockaddr_storage(); var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        _ = withUnsafeMutablePointer(to: &ss) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) } }
+        self.port = IPEndpoint.from(ss)?.port ?? 0
     }
     public func accept() throws -> TCPTransport {
         while true {

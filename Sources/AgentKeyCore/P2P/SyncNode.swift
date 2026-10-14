@@ -129,25 +129,60 @@ public final class SyncNode: @unchecked Sendable {
 
     // MARK: client sync
 
-    /// Sync with the home node (or every known peer endpoint). Returns per-peer results.
-    public func syncNow(connect: (String) throws -> FrameTransport = { try SyncEndpoint.dial($0, timeout: 5) }) throws -> [String: Result<SyncStats, Error>] {
+    /// Per-peer connection diagnostics from the last `syncNow` (candidate, outcome, timing).
+    public private(set) var lastDiagnostics: [String: [ConnectAttempt]] = [:]
+    /// Connectivity runtime (STUN, UDP hole punching, rendezvous). nil = plain endpoints only.
+    public var net: NetRuntime?
+
+    /// Sync with every paired peer we know how to reach. Candidates are raced ICE-style:
+    /// LAN Bonjour → direct IPv6 → configured/forwarded TCP → UDP hole punch → relay.
+    public func syncNow(via: ConnectVia = .auto, connect: @escaping (String) throws -> FrameTransport = { try SyncEndpoint.dial($0, timeout: 5) }) throws -> [String: Result<SyncStats, Error>] {
         guard let r = lock.withLock({ replica }) else { throw SyncNodeError.notInitialized }
         var out: [String: Result<SyncStats, Error>] = [:]
-        for (peer, eps) in peers.endpoints.sorted(by: { $0.key < $1.key }) where peer != identity.deviceID.raw {
+        var diags: [String: [ConnectAttempt]] = [:]
+        let peerIDs = Set(peers.endpoints.keys).union(net?.peersWithRecords() ?? [])
+            .filter { $0 != identity.deviceID.raw && r.trust.devices[$0]?.revokedAt == nil && r.trust.devices[$0] != nil }
+        let net = self.net
+        if let net, via == .auto || via == .udp { net.publishAll(blocking: false) }
+        for peer in peerIDs.sorted() {
+            let known = lock.withLock { peers.endpoints[peer] ?? [] }
+            var cands = known.map { NetCandidate.fromEndpoint($0, source: "lastKnown") }
+            if let net { cands += net.candidates(for: peer) }
+            let ordered = Connectivity.order(cands, via: via)
+            let fp = r.trust.devices[peer]?.fingerprint
+            var attempts: [ConnectAttempt] = []
             var res: Result<SyncStats, Error> = .failure(SyncNodeError.unreachable)
-            for ep in eps {
+            var remaining = ordered
+            while !remaining.isEmpty {
+                let (winner, att) = Connectivity.race(remaining, dial: { c in
+                    if c.kind == .udp { guard let net else { throw TransportError.connectFailed("udp needs the net runtime") }; return try net.dialUDP(peer: peer, candidate: c) }
+                    return try connect(c.addr)
+                })
+                attempts += att
+                remaining.removeAll { cand in att.contains { $0.candidate == cand.addr } }
+                guard let (t, c) = winner else { break }
                 do {
-                    let t = try connect(ep)
                     try t.send(Data(SecureChannel.prologueSync.utf8))
-                    let fp = r.trust.devices[peer]?.fingerprint
-                    res = .success(try SyncSession.runClient(r, over: t, pinnedFingerprint: fp)); break
+                    res = .success(try SyncSession.runClient(r, over: t, pinnedFingerprint: fp))
+                    let ep = c.endpointString
+                    lock.withLock {
+                        var l = peers.endpoints[peer] ?? []
+                        l.removeAll { $0 == ep }; l.insert(ep, at: 0)
+                        peers.endpoints[peer] = Array(l.prefix(8))
+                    }
+                    break
                 } catch let e as TransportError {
-                    if case .failure(let prev) = res, !(prev is TransportError || prev is SyncNodeError) { continue }  // keep the meaningful error
+                    attempts.append(ConnectAttempt(candidate: c.addr, kind: c.kind.rawValue, ok: false, ms: 0, error: "session: \(e)"))
                     res = .failure(e)
-                } catch { res = .failure(error); break }   // reached the peer: auth/protocol error is the answer
+                } catch {
+                    attempts.append(ConnectAttempt(candidate: c.addr, kind: c.kind.rawValue, ok: false, ms: 0, error: "session: \(error)"))
+                    res = .failure(error); break     // reached the peer: auth/protocol error is the answer
+                }
             }
-            out[peer] = res
+            if ordered.isEmpty { res = .failure(SyncNodeError.noCandidates) }
+            out[peer] = res; diags[peer] = attempts
         }
+        lock.withLock { lastDiagnostics = diags }
         try save()
         return out
     }
@@ -228,18 +263,39 @@ public final class SyncNode: @unchecked Sendable {
 }
 
 public enum SyncNodeError: Error, CustomStringConvertible {
-    case notInitialized, alreadyPaired, unreachable, cannotRevokeSelf
+    case notInitialized, alreadyPaired, unreachable, cannotRevokeSelf, noCandidates
     public var description: String {
         switch self {
         case .notInitialized: return "sync not set up on this device (run `agentkeyd --sync-node` on the home node, or `agentkey device pair <code>`)"
         case .alreadyPaired: return "this device is already paired"
         case .unreachable: return "no peer endpoint reachable"
         case .cannotRevokeSelf: return "cannot revoke this device from itself"
+        case .noCandidates: return "no way to reach this peer yet (no known endpoint, no rendezvous record; try `agentkey sync signal export/import`)"
         }
     }
 }
 
 public enum LocalAddresses {
+    /// Global-unicast IPv6 addresses (2000::/3) — reachable directly if the router's firewall allows it.
+    public static func ipv6Global() -> [String] {
+        var out: [String] = []
+        var ifa: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifa) == 0, let first = ifa else { return out }
+        defer { freeifaddrs(ifa) }
+        var p: UnsafeMutablePointer<ifaddrs>? = first
+        while let cur = p {
+            if let sa = cur.pointee.ifa_addr, Int32(sa.pointee.sa_family) == AF_INET6 {
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(sa, socklen_t(MemoryLayout<sockaddr_in6>.size), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                    let s = String(cString: host).split(separator: "%").first.map(String.init) ?? ""
+                    if IPEndpoint(host: s, port: 0).isGlobalIPv6 && !out.contains(s) { out.append(s) }
+                }
+            }
+            p = cur.pointee.ifa_next
+        }
+        return out
+    }
+
     /// Non-loopback IPv4 addresses of this machine (for pairing payloads). Includes Tailscale/WireGuard
     /// interfaces if up; users can add hostnames (e.g. a MagicDNS name) with `--host`.
     public static func ipv4() -> [String] {
@@ -271,7 +327,7 @@ public enum SyncEndpoint {
     public static let bonjourPrefix = "bonjour:"
 
     public static func make(host: String, port: UInt16) -> String {
-        host.hasPrefix(bonjourPrefix) ? host : "\(host):\(port)"
+        host.hasPrefix(bonjourPrefix) ? host : IPEndpoint(host: host, port: port).description
     }
 
     public static func dial(_ ep: String, timeout: TimeInterval) throws -> FrameTransport {
@@ -282,10 +338,8 @@ public enum SyncEndpoint {
             throw TransportError.connectFailed("Bonjour is not available on this platform (\(ep))")
             #endif
         }
-        guard let i = ep.lastIndex(of: ":"), let port = UInt16(ep[ep.index(after: i)...]) else {
-            throw TransportError.connectFailed("bad endpoint \(ep)")
-        }
-        return try TCPTransport.connect(host: String(ep[..<i]), port: port, timeout: timeout)
+        guard let e = IPEndpoint(ep) else { throw TransportError.connectFailed("bad endpoint \(ep)") }
+        return try TCPTransport.connect(host: e.host, port: e.port, timeout: timeout)
     }
 
     /// Bonjour instance name for a node: derived from its public key fingerprint only, so the
